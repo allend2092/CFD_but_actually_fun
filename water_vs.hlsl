@@ -1,8 +1,10 @@
 cbuffer RootConstants : register(b0)
 {
-    row_major float4x4 mvp;
-    float4 lightDir;     // xyz = direction from surface toward the light
-    float4 camPosTime;   // xyz = camera world position, w = time in seconds
+    row_major float4x4 mvpWater;
+    row_major float4x4 mvpModel;
+    row_major float4x4 model;
+    float4 lightDir;
+    float4 camPosTime;
 };
 
 struct VSIn
@@ -18,11 +20,22 @@ struct VSOut
     float3 normal : TEXCOORD1;
 };
 
+// Water vertices are already in world space.
 VSOut main(VSIn input)
 {
     VSOut o;
     o.world = input.position;
     o.normal = input.normal;
-    o.clip = mul(float4(input.position, 1.0), mvp);
+    o.clip = mul(float4(input.position, 1.0), mvpWater);
+    return o;
+}
+
+// Crate vertices are in body space; transform them.
+VSOut mainModel(VSIn input)
+{
+    VSOut o;
+    o.world = mul(float4(input.position, 1.0), model).xyz;
+    o.normal = normalize(mul(input.normal, (float3x3)model));
+    o.clip = mul(float4(input.position, 1.0), mvpModel);
     return o;
 }
