@@ -39,3 +39,28 @@ VSOut mainModel(VSIn input)
     o.clip = mul(float4(input.position, 1.0), mvpModel);
     return o;
 }
+
+struct VSInJetski
+{
+    float3 position : POSITION;
+    float3 normal : NORMAL;
+    float3 color : COLOR;
+};
+
+struct VSOutJetski
+{
+    float4 clip : SV_Position;
+    float3 world : TEXCOORD0;
+    float3 normal : TEXCOORD1;
+    float3 color : TEXCOORD2;
+};
+
+VSOutJetski mainJetski(VSInJetski input)
+{
+    VSOutJetski o;
+    o.world = mul(float4(input.position, 1.0), model).xyz;
+    o.normal = normalize(mul(input.normal, (float3x3)model));
+    o.color = input.color;
+    o.clip = mul(float4(input.position, 1.0), mvpModel);
+    return o;
+}
