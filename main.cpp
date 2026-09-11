@@ -18,6 +18,8 @@
 
 #include "assets/jetski_asset.h"
 #include "assets/jetski_internal.h"   // complete definition of jetski::Rig
+#include "assets/boat_sim.h"          // real-hull boat rigid body (planing + trim)
+#include "assets/wake_field.h"        // interactive boat-locked wake heightfield
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "d3d12.lib")
@@ -35,7 +37,6 @@ namespace {
     constexpr int   kCells = 128;
     constexpr float kHalf = 10.0f;
     constexpr float kGravity = 9.81f;
-    constexpr float kRhoWater = 1000.0f;
     constexpr float kSimDt = 1.0f / 120.0f;
     constexpr float kSteepness = 0.80f;
 
@@ -206,123 +207,59 @@ namespace {
     }
 
     // ---------------------------------------------------------------- rigid body
-    struct HullSample { Vec3 local; float weight; };
-    struct Body
-    {
-        Vec3 pos, vel, angVel;
-        Quat q;
-        float mass;
-        Vec3 inertia;
-        float halfW, halfH, halfD;
-        HullSample samples[5];
-    };
-
-    Body g_body;
+    boat::Boat      g_boat;
+    boat::WakeField g_wake(26.0f, 128, 2.6f, 1.4f, 0.9f);   // S,N,c,mu,sponge
     float g_simTime = 0.0f;
     float g_physAcc = 0.0f;
-    uint32_t g_randState = 123456789u;
 
-    float Rand01()
+    void ResetBoat()
     {
-        g_randState = g_randState * 1664525u + 1013904223u;
-        return (float)(g_randState >> 8) / 16777216.0f;
+        g_boat.reset(1.5f, 1.6f, 1.0f);
+        g_wake.clear();
     }
 
-    void DropBody()
+  void StepBoat(float dt)
     {
-        Body& b = g_body;
-        b.pos = { 1.5f, 1.6f, 1.0f };
-        b.vel = { 0, 0, 0 };
-        b.angVel = { (Rand01() - 0.5f) * 1.5f, (Rand01() - 0.5f) * 1.5f, (Rand01() - 0.5f) * 1.5f };
-        b.q = QuatNormalize(QuatMul(QuatFromAxisAngle({ 1, 0, 0 }, (Rand01() - 0.5f) * 0.6f),
-            QuatFromAxisAngle({ 0, 0, 1 }, (Rand01() - 0.5f) * 0.6f)));
-    }
+        const boat::Vec3 oldPos = g_boat.pos();
 
-    void InitBody()
-    {
-        const float w = 0.9f, h = 0.7f, d = 0.9f;
-        const float volume = w * h * d;
-        Body& b = g_body;
-        b.halfW = w * 0.5f; b.halfH = h * 0.5f; b.halfD = d * 0.5f;
-        b.mass = kRhoWater * volume * 0.45f;
-        b.inertia = { b.mass / 12.0f * (h * h + d * d),
-                      b.mass / 12.0f * (w * w + d * d),
-                      b.mass / 12.0f * (w * w + h * h) };
-        const float y = -b.halfH;
-        b.samples[0] = { { -b.halfW * 0.8f, y, -b.halfD * 0.8f }, 0.18f };
-        b.samples[1] = { {  b.halfW * 0.8f, y, -b.halfD * 0.8f }, 0.18f };
-        b.samples[2] = { {  b.halfW * 0.8f, y,  b.halfD * 0.8f }, 0.18f };
-        b.samples[3] = { { -b.halfW * 0.8f, y,  b.halfD * 0.8f }, 0.18f };
-        b.samples[4] = { { 0.0f, y, 0.0f }, 0.28f };
-        DropBody();
-    }
-
-    void StepBody(float dt)
-    {
-        Body& b = g_body;
-        Vec3 X, Y, Z;
-        QuatAxes(b.q, X, Y, Z);
-
-        Vec3 F = { 0.0f, -kGravity * b.mass, 0.0f };
-        Vec3 T = { 0, 0, 0 };
-
-        // Engine and steering (Milestone 5)
-        Vec3 forward = Z;
-        Vec3 engineForce = forward * (g_throttle * 3000.0f);
-        F = F + engineForce;
-
-        Vec3 dragForce = b.vel * (-150.0f - 40.0f * Length(b.vel));
-        F = F + dragForce;
-
-        Vec3 up = Y;
-        float speedFactor = std::min(1.0f, Length(b.vel) / 5.0f);
-        float steerTorque = g_steer * 1200.0f * speedFactor;
-        T = T + up * steerTorque;
-
-        for (int i = 0; i < 5; ++i)
+        // 1) water height at each hull sample = Gerstner + boat-locked wake
+        float wh[8];
+        for (int i = 0; i < g_boat.nSamples(); ++i)
         {
-            const Vec3& s = b.samples[i].local;
-            const Vec3 r = X * s.x + Y * s.y + Z * s.z;
-            const Vec3 wpos = b.pos + r;
-
-            float wh = 0; Vec3 wn;
-            SampleWaterWorld(wpos.x, wpos.z, g_simTime, &wh, &wn);
-            const float depth = wh - wpos.y;
-            if (depth <= 0.0f) continue;
-
-            const float frac = depth < (b.halfH * 2.0f) ? depth / (b.halfH * 2.0f) : 1.0f;
-            const float volume = (b.halfW * 2) * (b.halfH * 2) * (b.halfD * 2);
-            Vec3 Fs = { 0.0f, kRhoWater * kGravity * volume * b.samples[i].weight * frac, 0.0f };
-
-            const Vec3 vpt = b.vel + Cross(b.angVel, r);
-            const float speed = Length(vpt);
-            const float c = (90.0f + 25.0f * speed) * b.samples[i].weight;
-            Fs = Fs - vpt * c;
-
-            F = F + Fs;
-            T = T + Cross(r, Fs);
+            const boat::Vec3 sw = g_boat.sampleWorld(i);
+            float h; Vec3 n;
+            SampleWaterWorld(sw.x, sw.z, g_simTime, &h, &n);
+            wh[i] = h + g_wake.sample(sw.x - oldPos.x, sw.z - oldPos.z);
         }
 
-        b.vel = b.vel + F * (dt / b.mass);
-        if (Length(b.vel) > 30.0f) b.vel = Normalize(b.vel) * 30.0f;
-        b.pos = b.pos + b.vel * dt;
+        // 2) advance the boat (real hull + planing + trim)
+        g_boat.setControls(g_throttle, g_steer);
+        g_boat.step(dt, wh);
 
-        const Vec3 tb = { Dot(T, X), Dot(T, Y), Dot(T, Z) };
-        Vec3 wb = { Dot(b.angVel, X), Dot(b.angVel, Y), Dot(b.angVel, Z) };
-        const Vec3 Iw = { wb.x * b.inertia.x, wb.y * b.inertia.y, wb.z * b.inertia.z };
-        const Vec3 gyro = Cross(wb, Iw);
-        Vec3 alpha = { (tb.x - gyro.x) / b.inertia.x,
-                       (tb.y - gyro.y) / b.inertia.y,
-                       (tb.z - gyro.z) / b.inertia.z };
-        wb = wb + alpha * dt;
-        wb = wb * std::exp(-0.5f * dt);
-        if (Length(wb) > 12.0f) wb = Normalize(wb) * 12.0f;
-        b.angVel = X * wb.x + Y * wb.y + Z * wb.z;
+        // 3) boat-locked scroll so the wake trails the boat
+        const boat::Vec3 dp = boat::vsub(g_boat.pos(), oldPos);
+        g_wake.scroll(dp.x, dp.z);
 
-        const Quat wq = { b.angVel.x, b.angVel.y, b.angVel.z, 0.0f };
-        const Quat dq = QuatMul(wq, b.q);
-        b.q = QuatNormalize({ b.q.x + dq.x * 0.5f * dt, b.q.y + dq.y * 0.5f * dt,
-                              b.q.z + dq.z * 0.5f * dt, b.q.w + dq.w * 0.5f * dt });
+        // 4) inject: the hull plows the surface. Proximity-gated so a planing
+        //    (skimming) hull still writes its wake. Field coord = boat-relative.
+        const boat::Vec3 v    = g_boat.vel();
+        const float vY  = v.y;
+        const float vFwd = std::sqrt(v.x * v.x + v.z * v.z);
+        for (int i = 0; i < g_boat.nSamples(); ++i)
+        {
+            const boat::Vec3 sw = g_boat.sampleWorld(i);
+            const float rx = sw.x - g_boat.pos().x, rz = sw.z - g_boat.pos().z;
+            float h; Vec3 n;
+            SampleWaterWorld(sw.x, sw.z, g_simTime, &h, &n);
+            const float hSurf = h + g_wake.sample(rx, rz);
+            const float above = sw.y - hSurf;                       // >0 above water
+            const float prox  = std::clamp(1.0f - std::max(0.0f, above) / 0.3f, 0.0f, 1.0f);
+            const float wgt   = g_boat.config().samples[i].w * prox;
+            g_wake.inject(rx, rz, 0.0f, (vY * 4.0f - vFwd * 3.0f) * wgt * dt);
+        }
+
+        // 5) advance the wake field
+        g_wake.step(dt);
     }
 
     // ---------------------------------------------------------------- graphics
@@ -365,7 +302,7 @@ namespace {
         bool   prevF1 = false;
         bool   prevR = false;
         float  view[16] = {}, proj[16] = {};
-        float  rootConstants[56] = {};
+        float  rootConstants[64] = {};
         std::vector<float> baseX, baseZ;
 
 
@@ -457,10 +394,12 @@ namespace {
     {
         Vertex* dst = (Vertex*)g.vbMapped;
         const size_t count = g.baseX.size();
+        const boat::Vec3 bp = g_boat.pos();
         for (size_t i = 0; i < count; ++i)
         {
             Vec3 pos, n;
             GerstnerAt(g.baseX[i], g.baseZ[i], t, &pos, &n);
+            pos.y += g_wake.sample(g.baseX[i] - bp.x, g.baseZ[i] - bp.z);  // boat-locked wake
             Vertex& v = dst[i];
             v.px = pos.x; v.py = pos.y; v.pz = pos.z;
             v.nx = n.x;   v.ny = n.y;   v.nz = n.z;
@@ -557,7 +496,7 @@ namespace {
             g.dsvHeap->GetCPUDescriptorHandleForHeapStart());
 
         D3D12_ROOT_CONSTANTS rc{};
-        rc.Num32BitValues = 56;
+        rc.Num32BitValues = 64;
         rc.ShaderRegister = 0;
         rc.RegisterSpace = 0;
         D3D12_ROOT_PARAMETER rp{};
@@ -650,7 +589,7 @@ namespace {
         g.ibv.SizeInBytes = (UINT)indices.size() * sizeof(uint16_t);
         g.indexCount = (UINT)indices.size();
 
-        const float ex = g_body.halfW, ey = g_body.halfH, ez = g_body.halfD;
+        const float ex = 0.45f, ey = 0.35f, ez = 0.45f;   // crate half-extents (was the old boat box size)
         struct Face { Vec3 n; Vec3 u; Vec3 v; };
         const Face faces[6] = {
             { { 0, 0,-1 }, { 1, 0, 0 }, { 0, 1, 0 } },
@@ -734,29 +673,23 @@ namespace {
 
         float mvpWater[16], model[16], mvpModel[16], tmp[16];
         Mat4Multiply(g.view, g.proj, mvpWater);
-        Mat4FromQuatPos(g_body.q, g_body.pos, model);
 
+        // Fill the rider state from the boat (real hull). Support height/normal
+        // under the hull center = Gerstner + wake (field coord 0 = boat center).
         jetski::VehicleState vs{};
-        vs.time = t;
-        vs.throttle = g_throttle;
-        vs.steer = g_steer;
-        vs.hullPosition[0] = g_body.pos.x;
-        vs.hullPosition[1] = g_body.pos.y;
-        vs.hullPosition[2] = g_body.pos.z;
+        {
+            float supH; Vec3 supN;
+            SampleWaterWorld(g_boat.pos().x, g_boat.pos().z, t, &supH, &supN);
+            supH += g_wake.sample(0, 0);
+            g_boat.vehicleState(t, supH, boat::Vec3{supN.x, supN.y, supN.z}, vs);
+        }
+        // World model matrix from the boat's basis (cols X,Y,Z) + position.
         for (int i = 0; i < 3; ++i)
-            for (int k = 0; k < 3; ++k)
-                vs.hullBasis[i * 3 + k] = model[k * 4 + i];   // the transpose
-        vs.hullVelocity[0] = g_body.vel.x;
-        vs.hullVelocity[1] = g_body.vel.y;
-        vs.hullVelocity[2] = g_body.vel.z;
-        vs.hullAngularVel[0] = g_body.angVel.x;
-        vs.hullAngularVel[1] = g_body.angVel.y;
-        vs.hullAngularVel[2] = g_body.angVel.z;
-        Vec3 supportN;
-        SampleWaterWorld(g_body.pos.x, g_body.pos.z, t, &vs.supportHeight, &supportN);
-        vs.supportNormal[0] = supportN.x;
-        vs.supportNormal[1] = supportN.y;
-        vs.supportNormal[2] = supportN.z;
+            for (int j = 0; j < 3; ++j)
+                model[i * 4 + j] = vs.hullBasis[i * 3 + j];
+        model[3] = 0; model[7] = 0; model[11] = 0;
+        model[12] = vs.hullPosition[0]; model[13] = vs.hullPosition[1]; model[14] = vs.hullPosition[2];
+        model[15] = 1;
 
         jetski::rig_pose(g.rig, vs, std::span<jetski::AssetVertex>(g.posedVerts));
         memcpy(g.jvbMapped, g.posedVerts.data(), g.posedVerts.size() * sizeof(jetski::AssetVertex));
@@ -771,6 +704,12 @@ namespace {
         const Vec3 L = Normalize({ 0.35f, 0.65f, -0.50f });
         rc[48] = L.x; rc[49] = L.y; rc[50] = L.z; rc[51] = 0.0f;
         rc[52] = 0.0f; rc[53] = 2.5f; rc[54] = -9.0f; rc[55] = t;
+        // boatState + wakeParams for the water foam (procedural V in water_ps).
+        const float fl = std::sqrt(vs.hullBasis[6] * vs.hullBasis[6] + vs.hullBasis[8] * vs.hullBasis[8]);
+        rc[56] = vs.hullPosition[0]; rc[57] = vs.hullPosition[2];
+        rc[58] = (fl > 1e-5f) ? vs.hullBasis[6] / fl : 0.0f;   // fwd.x (hull +Z in world)
+        rc[59] = (fl > 1e-5f) ? vs.hullBasis[8] / fl : 1.0f;   // fwd.z
+        rc[60] = g_boat.speed(); rc[61] = g_throttle; rc[62] = 1.0f; rc[63] = t;
 
         g.allocator->Reset();
         g.cmdList->Reset(g.allocator.Get(), nullptr);
@@ -805,7 +744,7 @@ namespace {
         D3D12_RECT scissor{ 0, 0, (LONG)kWidth, (LONG)kHeight };
         g.cmdList->RSSetViewports(1, &vp);
         g.cmdList->RSSetScissorRects(1, &scissor);
-        g.cmdList->SetGraphicsRoot32BitConstants(0, 56, rc, 0);
+        g.cmdList->SetGraphicsRoot32BitConstants(0, 64, rc, 0);
 
         g.cmdList->SetPipelineState(g.wireframe ? g.psoWire.Get() : g.psoSolid.Get());
         g.cmdList->IASetVertexBuffers(0, 1, &g.vbv);
@@ -861,7 +800,7 @@ namespace {
 int main()
 {
     InitWaves();
-    InitBody();
+    ResetBoat();
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -900,7 +839,7 @@ int main()
         g.prevF1 = f1Down;
 
         const bool rDown = (GetAsyncKeyState('R') & 0x8000) != 0;
-        if (rDown && !g.prevR) DropBody();
+        if (rDown && !g.prevR) ResetBoat();
         g.prevR = rDown;
 
         const double now = NowSeconds();
@@ -919,7 +858,7 @@ int main()
         g_physAcc += (float)frameDt;
         while (g_physAcc >= kSimDt)
         {
-            StepBody(kSimDt);
+            StepBoat(kSimDt);
             g_simTime += kSimDt;
             g_physAcc -= kSimDt;
         }
