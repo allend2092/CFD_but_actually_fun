@@ -53,3 +53,29 @@ float4 psCrate(VSOut input) : SV_Target
     col = lerp(col, col * 0.35, wet);
     return float4(col, 1.0);
 }
+
+struct VSOutJetski
+{
+    float4 clip : SV_Position;
+    float3 world : TEXCOORD0;
+    float3 normal : TEXCOORD1;
+    float3 color : TEXCOORD2;
+};
+
+float4 psJetski(VSOutJetski input) : SV_Target
+{
+    float3 N = normalize(input.normal);
+    float3 L = normalize(lightDir.xyz);
+    float ndl = saturate(dot(N, L));
+
+    float3 albedo = input.color;
+    float3 col = albedo * (0.25 + 0.75 * ndl);
+
+    float3 V = normalize(camPosTime.xyz - input.world);
+    float3 H = normalize(L + V);
+    col += pow(saturate(dot(N, H)), 40.0) * 0.15;
+
+    float wet = smoothstep(0.15, -0.05, input.world.y);
+    col = lerp(col, col * 0.35, wet);
+    return float4(col, 1.0);
+}
