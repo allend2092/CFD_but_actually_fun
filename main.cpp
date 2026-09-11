@@ -1,6 +1,8 @@
+#define NOMINMAX
+#include <windows.h>
+
 // main.cpp
-// Milestone 4: Gerstner waves, world-space water sampler with inversion,
-// buoyant rigid-body crate (Euler equations), fixed 120 Hz timestep.
+// Milestone 5: Jetski integration. The local model's rider meets the Gerstner ocean.
 
 #include <windows.h>
 #include <d3d12.h>
@@ -12,6 +14,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <vector>
+#include <span>
+
+#include "assets/jetski_asset.h"
+#include "assets/jetski_internal.h"   // complete definition of jetski::Rig
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "d3d12.lib")
@@ -46,6 +52,9 @@ namespace {
 
     struct WaveRuntime { float dirX, dirZ, k, omega, amp, phase0, q; };
     WaveRuntime g_waves[kNumWaves];
+
+    float g_throttle = 0.0f;
+    float g_steer = 0.0f;
 
     // ---------------------------------------------------------------- math types
     struct Vec3 { float x, y, z; };
@@ -145,16 +154,13 @@ namespace {
             w.dirX = r.dirX / len;
             w.dirZ = r.dirZ / len;
             w.k = 6.28318530718f / r.wavelength;
-            w.omega = std::sqrt(kGravity * w.k);              // deep-water dispersion
+            w.omega = std::sqrt(kGravity * w.k);
             w.amp = r.amp;
             w.phase0 = r.phase0;
-            // Steepness budget: sum(q_i * k_i * A_i) == kSteepness < 1 avoids loops.
             w.q = kSteepness / (w.k * w.amp * (float)kNumWaves);
         }
-        std::printf("[water] Gerstner waves, steepness %.2f, sampler inverts horizontal shift.\n", kSteepness);
     }
 
-    // Gerstner evaluation at MATERIAL coordinate p: returns displaced pos + normal.
     void GerstnerAt(float px, float pz, float t, Vec3* outPos, Vec3* outNormal)
     {
         float sx = 0, sy = 0, sz = 0;
@@ -176,8 +182,6 @@ namespace {
         *outNormal = Normalize({ nx, ny, nz });
     }
 
-    // World-space query: invert the horizontal displacement by fixed-point
-    // iteration, then evaluate. This is what buoyancy calls every tick.
     void SampleWaterWorld(float wx, float wz, float t, float* outHeight, Vec3* outNormal)
     {
         float px = wx, pz = wz;
@@ -208,7 +212,7 @@ namespace {
         Vec3 pos, vel, angVel;
         Quat q;
         float mass;
-        Vec3 inertia;          // body-space diagonal (box)
+        Vec3 inertia;
         float halfW, halfH, halfD;
         HullSample samples[5];
     };
@@ -232,7 +236,6 @@ namespace {
         b.angVel = { (Rand01() - 0.5f) * 1.5f, (Rand01() - 0.5f) * 1.5f, (Rand01() - 0.5f) * 1.5f };
         b.q = QuatNormalize(QuatMul(QuatFromAxisAngle({ 1, 0, 0 }, (Rand01() - 0.5f) * 0.6f),
             QuatFromAxisAngle({ 0, 0, 1 }, (Rand01() - 0.5f) * 0.6f)));
-        std::printf("[body] dropped at t=%.2f s\n", g_simTime);
     }
 
     void InitBody()
@@ -241,7 +244,7 @@ namespace {
         const float volume = w * h * d;
         Body& b = g_body;
         b.halfW = w * 0.5f; b.halfH = h * 0.5f; b.halfD = d * 0.5f;
-        b.mass = kRhoWater * volume * 0.45f;    // floats ~45% submerged
+        b.mass = kRhoWater * volume * 0.45f;
         b.inertia = { b.mass / 12.0f * (h * h + d * d),
                       b.mass / 12.0f * (w * w + d * d),
                       b.mass / 12.0f * (w * w + h * h) };
@@ -251,12 +254,8 @@ namespace {
         b.samples[2] = { {  b.halfW * 0.8f, y,  b.halfD * 0.8f }, 0.18f };
         b.samples[3] = { { -b.halfW * 0.8f, y,  b.halfD * 0.8f }, 0.18f };
         b.samples[4] = { { 0.0f, y, 0.0f }, 0.28f };
-        std::printf("[body] crate %.1fx%.1fx%.1f m, mass %.0f kg, target submersion 45%%. R = redrop.\n",
-            w, h, d, b.mass);
         DropBody();
     }
-
-
 
     void StepBody(float dt)
     {
@@ -266,6 +265,19 @@ namespace {
 
         Vec3 F = { 0.0f, -kGravity * b.mass, 0.0f };
         Vec3 T = { 0, 0, 0 };
+
+        // Engine and steering (Milestone 5)
+        Vec3 forward = Z;
+        Vec3 engineForce = forward * (g_throttle * 3000.0f);
+        F = F + engineForce;
+
+        Vec3 dragForce = b.vel * (-150.0f - 40.0f * Length(b.vel));
+        F = F + dragForce;
+
+        Vec3 up = Y;
+        float speedFactor = std::min(1.0f, Length(b.vel) / 5.0f);
+        float steerTorque = g_steer * 1200.0f * speedFactor;
+        T = T + up * steerTorque;
 
         for (int i = 0; i < 5; ++i)
         {
@@ -282,7 +294,6 @@ namespace {
             const float volume = (b.halfW * 2) * (b.halfH * 2) * (b.halfD * 2);
             Vec3 Fs = { 0.0f, kRhoWater * kGravity * volume * b.samples[i].weight * frac, 0.0f };
 
-            // Drag at the sample point (includes rotational velocity -> angular damping).
             const Vec3 vpt = b.vel + Cross(b.angVel, r);
             const float speed = Length(vpt);
             const float c = (90.0f + 25.0f * speed) * b.samples[i].weight;
@@ -292,12 +303,10 @@ namespace {
             T = T + Cross(r, Fs);
         }
 
-        // Linear integrate (semi-implicit Euler).
         b.vel = b.vel + F * (dt / b.mass);
         if (Length(b.vel) > 30.0f) b.vel = Normalize(b.vel) * 30.0f;
         b.pos = b.pos + b.vel * dt;
 
-        // Rotational integrate: Euler's equations in BODY space.
         const Vec3 tb = { Dot(T, X), Dot(T, Y), Dot(T, Z) };
         Vec3 wb = { Dot(b.angVel, X), Dot(b.angVel, Y), Dot(b.angVel, Z) };
         const Vec3 Iw = { wb.x * b.inertia.x, wb.y * b.inertia.y, wb.z * b.inertia.z };
@@ -331,17 +340,23 @@ namespace {
         ComPtr<ID3D12PipelineState>       psoSolid;
         ComPtr<ID3D12PipelineState>       psoWire;
         ComPtr<ID3D12PipelineState>       psoCrate;
+        ComPtr<ID3D12PipelineState>       psoJetski;
         ComPtr<ID3D12Resource>            vertexBuffer;
         ComPtr<ID3D12Resource>            indexBuffer;
         ComPtr<ID3D12Resource>            crateVB;
         ComPtr<ID3D12Resource>            crateIB;
+        ComPtr<ID3D12Resource>            jetskiVB;
+        ComPtr<ID3D12Resource>            jetskiIB;
         ComPtr<ID3D12Fence>               fence;
         D3D12_VERTEX_BUFFER_VIEW          vbv{};
         D3D12_INDEX_BUFFER_VIEW           ibv{};
         D3D12_VERTEX_BUFFER_VIEW          cvbv{};
         D3D12_INDEX_BUFFER_VIEW           cibv{};
+        D3D12_VERTEX_BUFFER_VIEW          jvbv{};
+        D3D12_INDEX_BUFFER_VIEW           jibv{};
         HANDLE fenceEvent = nullptr;
         void* vbMapped = nullptr;
+        void* jvbMapped = nullptr;
         UINT64 fenceValue = 0;
         UINT   rtvIncrement = 0;
         UINT   frameIndex = 0;
@@ -352,6 +367,10 @@ namespace {
         float  view[16] = {}, proj[16] = {};
         float  rootConstants[56] = {};
         std::vector<float> baseX, baseZ;
+
+
+        jetski::Rig                       rig;
+        std::vector<jetski::AssetVertex>  posedVerts;
     } g;
 
     LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -457,7 +476,6 @@ namespace {
         {
             dbg->EnableDebugLayer();
             debugOn = true;
-            std::printf("[gfx] D3D12 debug layer ON.\n");
         }
 #endif
 
@@ -473,7 +491,6 @@ namespace {
             DXGI_ADAPTER_DESC1 desc{};
             adapter->GetDesc1(&desc);
             if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) { adapter.Reset(); continue; }
-            std::printf("[gfx] Adapter: %ls\n", desc.Description);
             break;
         }
 
@@ -539,7 +556,6 @@ namespace {
         g.device->CreateDepthStencilView(g.depthTex.Get(), nullptr,
             g.dsvHeap->GetCPUDescriptorHandleForHeapStart());
 
-        // Root signature: 56 root constants (mvpWater | mvpModel | model | light | cam).
         D3D12_ROOT_CONSTANTS rc{};
         rc.Num32BitValues = 56;
         rc.ShaderRegister = 0;
@@ -555,25 +571,47 @@ namespace {
 
         ComPtr<ID3DBlob> sigBlob, sigErr;
         if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sigBlob, &sigErr)))
-        {
-            if (sigErr) std::printf("[rs] %s\n", (const char*)sigErr->GetBufferPointer());
             return false;
-        }
         if (FAILED(g.device->CreateRootSignature(0, sigBlob->GetBufferPointer(),
             sigBlob->GetBufferSize(), IID_PPV_ARGS(&g.rootSig))))
             return false;
 
         ComPtr<ID3DBlob> vsWater = CompileShader(L"water_vs.hlsl", "main", "vs_5_0");
         ComPtr<ID3DBlob> vsModel = CompileShader(L"water_vs.hlsl", "mainModel", "vs_5_0");
+        ComPtr<ID3DBlob> vsJetski = CompileShader(L"water_vs.hlsl", "mainJetski", "vs_5_0");
         ComPtr<ID3DBlob> psWater = CompileShader(L"water_ps.hlsl", "main", "ps_5_0");
         ComPtr<ID3DBlob> psCrate = CompileShader(L"water_ps.hlsl", "psCrate", "ps_5_0");
-        if (!vsWater || !vsModel || !psWater || !psCrate) return false;
+        ComPtr<ID3DBlob> psJetski = CompileShader(L"water_ps.hlsl", "psJetski", "ps_5_0");
+        if (!vsWater || !vsModel || !vsJetski || !psWater || !psCrate || !psJetski) return false;
 
         g.psoSolid = MakePso(vsWater.Get(), psWater.Get(), D3D12_FILL_MODE_SOLID);
         g.psoWire = MakePso(vsWater.Get(), psWater.Get(), D3D12_FILL_MODE_WIREFRAME);
         g.psoCrate = MakePso(vsModel.Get(), psCrate.Get(), D3D12_FILL_MODE_SOLID);
-        if (!g.psoSolid || !g.psoWire || !g.psoCrate) return false;
-        std::printf("[gfx] PSOs: water solid/wire + crate. F1 wireframe, R redrop.\n");
+
+        D3D12_INPUT_ELEMENT_DESC layoutJetski[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "COLOR",    0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        };
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pdJ{};
+        pdJ.pRootSignature = g.rootSig.Get();
+        pdJ.VS = { vsJetski->GetBufferPointer(), vsJetski->GetBufferSize() };
+        pdJ.PS = { psJetski->GetBufferPointer(), psJetski->GetBufferSize() };
+        pdJ.InputLayout = { layoutJetski, 3 };
+        pdJ.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pdJ.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pdJ.RasterizerState.DepthClipEnable = TRUE;
+        pdJ.DepthStencilState.DepthEnable = TRUE;
+        pdJ.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        pdJ.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        pdJ.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pdJ.SampleMask = UINT_MAX;
+        pdJ.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pdJ.NumRenderTargets = 1;
+        pdJ.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pdJ.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        pdJ.SampleDesc.Count = 1;
+        if (FAILED(g.device->CreateGraphicsPipelineState(&pdJ, IID_PPV_ARGS(&g.psoJetski)))) return false;
 
         const int n = kCells + 1;
         g.baseX.reserve((size_t)n * n);
@@ -612,7 +650,6 @@ namespace {
         g.ibv.SizeInBytes = (UINT)indices.size() * sizeof(uint16_t);
         g.indexCount = (UINT)indices.size();
 
-        // --- Crate mesh: 24 verts (4 per face, real normals), 36 indices. ---
         const float ex = g_body.halfW, ey = g_body.halfH, ez = g_body.halfD;
         struct Face { Vec3 n; Vec3 u; Vec3 v; };
         const Face faces[6] = {
@@ -628,13 +665,14 @@ namespace {
         for (int f = 0; f < 6; ++f)
         {
             const Vec3 n = faces[f].n, u = faces[f].u, v = faces[f].v;
-            const Vec3 c = n;   // face center = normal * half-extent along n
+            const Vec3 c = n;
             const Vec3 center = { c.x * ex, c.y * ey, c.z * ez };
             const Vec3 eu = { u.x * ex, u.y * ey, u.z * ez };
             const Vec3 ev = { v.x * ex, v.y * ey, v.z * ez };
             const uint16_t base = (uint16_t)cverts.size();
             const float su[4] = { -1, -1, 1, 1 };
             const float sv[4] = { -1, 1, 1, -1 };
+
             for (int k = 0; k < 4; ++k)
             {
                 Vertex vtx{};
@@ -644,6 +682,8 @@ namespace {
                 vtx.nx = n.x; vtx.ny = n.y; vtx.nz = n.z;
                 cverts.push_back(vtx);
             }
+
+            // The narrowing fix: explicitly cast to uint16_t to satisfy MSVC
             const uint16_t b0 = base;
             const uint16_t b1 = (uint16_t)(base + 1);
             const uint16_t b2 = (uint16_t)(base + 2);
@@ -662,13 +702,29 @@ namespace {
         g.cibv.Format = DXGI_FORMAT_R16_UINT;
         g.cibv.SizeInBytes = (UINT)(cindices.size() * sizeof(uint16_t));
 
+        // Jetski setup
+        jetski::rig_create(g.rig);
+        const auto& topo = jetski::rig_topology(g.rig);
+        g.posedVerts.resize(topo.vertexCount);
+
+        const UINT64 jvbSize = (UINT64)topo.vertexCount * sizeof(jetski::AssetVertex);
+        g.jetskiVB = CreateUploadBuffer(g.device.Get(), nullptr, jvbSize);
+        g.jetskiVB->Map(0, nullptr, &g.jvbMapped);
+        g.jvbv.BufferLocation = g.jetskiVB->GetGPUVirtualAddress();
+        g.jvbv.StrideInBytes = sizeof(jetski::AssetVertex);
+        g.jvbv.SizeInBytes = (UINT)jvbSize;
+
+        const UINT64 jibSize = (UINT64)topo.indexCount * sizeof(uint32_t);
+        g.jetskiIB = CreateUploadBuffer(g.device.Get(), topo.indices, jibSize);
+        g.jibv.BufferLocation = g.jetskiIB->GetGPUVirtualAddress();
+        g.jibv.Format = DXGI_FORMAT_R32_UINT;
+        g.jibv.SizeInBytes = (UINT)jibSize;
+
         Mat4LookAtLH({ 0.0f, 2.5f, -9.0f }, { 0.6f, 0.0f, 2.0f }, { 0.0f, 1.0f, 0.0f }, g.view);
         Mat4PerspectiveLH(1.05f, (float)kWidth / (float)kHeight, 0.1f, 200.0f, g.proj);
 
         if (FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence)))) return false;
         g.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        std::printf("[gfx] Grid: %zu verts, %u indices; crate: %zu verts.\n",
-            g.baseX.size(), g.indexCount, cverts.size());
         return true;
     }
 
@@ -679,6 +735,32 @@ namespace {
         float mvpWater[16], model[16], mvpModel[16], tmp[16];
         Mat4Multiply(g.view, g.proj, mvpWater);
         Mat4FromQuatPos(g_body.q, g_body.pos, model);
+
+        jetski::VehicleState vs{};
+        vs.time = t;
+        vs.throttle = g_throttle;
+        vs.steer = g_steer;
+        vs.hullPosition[0] = g_body.pos.x;
+        vs.hullPosition[1] = g_body.pos.y;
+        vs.hullPosition[2] = g_body.pos.z;
+        for (int i = 0; i < 3; ++i)
+            for (int k = 0; k < 3; ++k)
+                vs.hullBasis[i * 3 + k] = model[k * 4 + i];   // the transpose
+        vs.hullVelocity[0] = g_body.vel.x;
+        vs.hullVelocity[1] = g_body.vel.y;
+        vs.hullVelocity[2] = g_body.vel.z;
+        vs.hullAngularVel[0] = g_body.angVel.x;
+        vs.hullAngularVel[1] = g_body.angVel.y;
+        vs.hullAngularVel[2] = g_body.angVel.z;
+        Vec3 supportN;
+        SampleWaterWorld(g_body.pos.x, g_body.pos.z, t, &vs.supportHeight, &supportN);
+        vs.supportNormal[0] = supportN.x;
+        vs.supportNormal[1] = supportN.y;
+        vs.supportNormal[2] = supportN.z;
+
+        jetski::rig_pose(g.rig, vs, std::span<jetski::AssetVertex>(g.posedVerts));
+        memcpy(g.jvbMapped, g.posedVerts.data(), g.posedVerts.size() * sizeof(jetski::AssetVertex));
+
         Mat4Multiply(model, g.view, tmp);
         Mat4Multiply(tmp, g.proj, mvpModel);
 
@@ -725,17 +807,20 @@ namespace {
         g.cmdList->RSSetScissorRects(1, &scissor);
         g.cmdList->SetGraphicsRoot32BitConstants(0, 56, rc, 0);
 
-        // Water pass.
         g.cmdList->SetPipelineState(g.wireframe ? g.psoWire.Get() : g.psoSolid.Get());
         g.cmdList->IASetVertexBuffers(0, 1, &g.vbv);
         g.cmdList->IASetIndexBuffer(&g.ibv);
         g.cmdList->DrawIndexedInstanced(g.indexCount, 1, 0, 0, 0);
 
-        // Crate pass.
         g.cmdList->SetPipelineState(g.psoCrate.Get());
         g.cmdList->IASetVertexBuffers(0, 1, &g.cvbv);
         g.cmdList->IASetIndexBuffer(&g.cibv);
         g.cmdList->DrawIndexedInstanced(36, 1, 0, 0, 0);
+
+        g.cmdList->SetPipelineState(g.psoJetski.Get());
+        g.cmdList->IASetVertexBuffers(0, 1, &g.jvbv);
+        g.cmdList->IASetIndexBuffer(&g.jibv);
+        g.cmdList->DrawIndexedInstanced((UINT)jetski::rig_topology(g.rig).indexCount, 1, 0, 0, 0);
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -766,15 +851,15 @@ namespace {
             WaitForSingleObject(g.fenceEvent, INFINITE);
         }
         if (g.vbMapped) g.vertexBuffer->Unmap(0, nullptr);
+        if (g.jvbMapped) g.jetskiVB->Unmap(0, nullptr);
+        jetski::rig_destroy(g.rig);
         CloseHandle(g.fenceEvent);
-        std::printf("[gfx] GPU idle, shutdown clean.\n");
     }
 
 } // namespace
 
 int main()
 {
-    std::printf("CFD_but_actually_fun: opening window...\n");
     InitWaves();
     InitBody();
 
@@ -796,11 +881,7 @@ int main()
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 
-    if (!InitGraphics(hwnd))
-    {
-        std::printf("[gfx] Initialization FAILED.\n");
-        return 1;
-    }
+    if (!InitGraphics(hwnd)) return 1;
 
     double prev = NowSeconds();
     bool running = true;
@@ -815,22 +896,26 @@ int main()
         if (!running) break;
 
         const bool f1Down = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
-        if (f1Down && !g.prevF1)
-        {
-            g.wireframe = !g.wireframe;
-            std::printf("[ui] wireframe %s\n", g.wireframe ? "ON" : "OFF");
-        }
+        if (f1Down && !g.prevF1) g.wireframe = !g.wireframe;
         g.prevF1 = f1Down;
 
         const bool rDown = (GetAsyncKeyState('R') & 0x8000) != 0;
         if (rDown && !g.prevR) DropBody();
         g.prevR = rDown;
 
-        // Fixed-timestep physics: frame-rate independent, deterministic.
         const double now = NowSeconds();
         double frameDt = now - prev;
         prev = now;
         if (frameDt > 0.25) frameDt = 0.25;
+
+        const float dtInput = (float)frameDt;
+        if (GetAsyncKeyState('W') & 0x8000) g_throttle = std::min(1.0f, g_throttle + 2.0f * dtInput);
+        else g_throttle = std::max(0.0f, g_throttle - 2.0f * dtInput);
+
+        if (GetAsyncKeyState('A') & 0x8000) g_steer = std::max(-1.0f, g_steer - 3.0f * dtInput);
+        else if (GetAsyncKeyState('D') & 0x8000) g_steer = std::min(1.0f, g_steer + 3.0f * dtInput);
+        else g_steer *= std::exp(-5.0f * dtInput);
+
         g_physAcc += (float)frameDt;
         while (g_physAcc >= kSimDt)
         {
@@ -843,6 +928,5 @@ int main()
     }
 
     ShutdownGraphics();
-    std::printf("Window closed cleanly. Goodbye.\n");
     return 0;
 }
