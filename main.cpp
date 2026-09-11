@@ -1,6 +1,6 @@
 // main.cpp
-// Milestone 3: animated sum-of-sines water with deep-water dispersion,
-// analytic normals, solid lighting, crest foam, F1 wireframe toggle.
+// Milestone 4: Gerstner waves, world-space water sampler with inversion,
+// buoyant rigid-body crate (Euler equations), fixed 120 Hz timestep.
 
 #include <windows.h>
 #include <d3d12.h>
@@ -26,64 +26,64 @@ namespace {
     constexpr UINT kWidth = 1280;
     constexpr UINT kHeight = 720;
 
-    constexpr int   kCells = 128;         // Finer grid: resolves short waves.
+    constexpr int   kCells = 128;
     constexpr float kHalf = 10.0f;
     constexpr float kGravity = 9.81f;
+    constexpr float kRhoWater = 1000.0f;
+    constexpr float kSimDt = 1.0f / 120.0f;
+    constexpr float kSteepness = 0.80f;
 
     struct Vertex { float px, py, pz, nx, ny, nz; };
 
-    // Wave recipe: direction, wavelength, amplitude, initial phase.
     struct WaveRecipe { float dirX, dirZ, wavelength, amp, phase0; };
     constexpr WaveRecipe kWaveRecipes[] = {
-        {  1.00f, 0.15f, 7.0f, 0.32f, 0.0f },   // Long swell.
-        {  0.80f, 0.60f, 4.3f, 0.18f, 1.7f },   // Medium chop.
-        {  0.35f, 1.00f, 2.6f, 0.10f, 3.1f },   // Short chop.
-        { -0.25f, 0.95f, 1.6f, 0.05f, 4.2f },   // Ripples.
+        {  1.00f, 0.15f, 7.0f, 0.32f, 0.0f },
+        {  0.80f, 0.60f, 4.3f, 0.18f, 1.7f },
+        {  0.35f, 1.00f, 2.6f, 0.10f, 3.1f },
+        { -0.25f, 0.95f, 1.6f, 0.05f, 4.2f },
     };
+    constexpr int kNumWaves = 4;
 
-    struct WaveRuntime { float dirX, dirZ, k, omega, amp, phase0; };
-    std::vector<WaveRuntime> g_waves;
+    struct WaveRuntime { float dirX, dirZ, k, omega, amp, phase0, q; };
+    WaveRuntime g_waves[kNumWaves];
 
-    struct Graphics
-    {
-        ComPtr<ID3D12Device>              device;
-        ComPtr<ID3D12CommandQueue>        queue;
-        ComPtr<ID3D12CommandAllocator>    allocator;
-        ComPtr<ID3D12GraphicsCommandList> cmdList;
-        ComPtr<IDXGISwapChain3>           swapChain;
-        ComPtr<ID3D12DescriptorHeap>      rtvHeap;
-        ComPtr<ID3D12DescriptorHeap>      dsvHeap;
-        ComPtr<ID3D12Resource>            depthTex;
-        ComPtr<ID3D12RootSignature>       rootSig;
-        ComPtr<ID3D12PipelineState>       psoSolid;
-        ComPtr<ID3D12PipelineState>       psoWire;
-        ComPtr<ID3D12Resource>            vertexBuffer;
-        ComPtr<ID3D12Resource>            indexBuffer;
-        ComPtr<ID3D12Fence>               fence;
-        D3D12_VERTEX_BUFFER_VIEW          vbv{};
-        D3D12_INDEX_BUFFER_VIEW           ibv{};
-        HANDLE fenceEvent = nullptr;
-        void* vbMapped = nullptr;
-        UINT64 fenceValue = 0;
-        UINT   rtvIncrement = 0;
-        UINT   frameIndex = 0;
-        UINT   indexCount = 0;
-        bool   wireframe = false;
-        bool   prevF1 = false;
-        float  mvp[16] = {};
-        float  rootConstants[24] = {};
-        std::vector<float> baseX, baseZ;
-    } g;
-
-    // ---------------------------------------------------------------- small math
+    // ---------------------------------------------------------------- math types
     struct Vec3 { float x, y, z; };
+    inline Vec3 operator+(Vec3 a, Vec3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
     inline Vec3 operator-(Vec3 a, Vec3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+    inline Vec3 operator*(Vec3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
     inline float Dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
     inline Vec3 Cross(Vec3 a, Vec3 b)
     {
         return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
     }
-    inline Vec3 Normalize(Vec3 v) { const float l = std::sqrt(Dot(v, v)); return { v.x / l, v.y / l, v.z / l }; }
+    inline float Length(Vec3 v) { return std::sqrt(Dot(v, v)); }
+    inline Vec3 Normalize(Vec3 v) { const float l = Length(v); return v * (1.0f / l); }
+
+    struct Quat { float x, y, z, w; };
+    inline Quat QuatMul(Quat a, Quat b)
+    {
+        return { a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                 a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                 a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                 a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+    }
+    inline Quat QuatFromAxisAngle(Vec3 axis, float angle)
+    {
+        const float s = std::sin(angle * 0.5f);
+        return { axis.x * s, axis.y * s, axis.z * s, std::cos(angle * 0.5f) };
+    }
+    inline Quat QuatNormalize(Quat q)
+    {
+        const float l = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+        return { q.x / l, q.y / l, q.z / l, q.w / l };
+    }
+    inline void QuatAxes(Quat q, Vec3& X, Vec3& Y, Vec3& Z)
+    {
+        X = { 1 - 2 * (q.y * q.y + q.z * q.z), 2 * (q.x * q.y + q.w * q.z), 2 * (q.x * q.z - q.w * q.y) };
+        Y = { 2 * (q.x * q.y - q.w * q.z), 1 - 2 * (q.x * q.x + q.z * q.z), 2 * (q.y * q.z + q.w * q.x) };
+        Z = { 2 * (q.x * q.z + q.w * q.y), 2 * (q.y * q.z - q.w * q.x), 1 - 2 * (q.x * q.x + q.y * q.y) };
+    }
 
     void Mat4Multiply(const float a[16], const float b[16], float out[16])
     {
@@ -118,11 +118,241 @@ namespace {
         out[12] = -Dot(x, eye); out[13] = -Dot(y, eye); out[14] = -Dot(z, eye); out[15] = 1.0f;
     }
 
+    void Mat4FromQuatPos(Quat q, Vec3 p, float out[16])
+    {
+        Vec3 X, Y, Z;
+        QuatAxes(q, X, Y, Z);
+        out[0] = X.x;  out[1] = X.y;  out[2] = X.z;  out[3] = 0.0f;
+        out[4] = Y.x;  out[5] = Y.y;  out[6] = Y.z;  out[7] = 0.0f;
+        out[8] = Z.x;  out[9] = Z.y;  out[10] = Z.z; out[11] = 0.0f;
+        out[12] = p.x; out[13] = p.y; out[14] = p.z; out[15] = 1.0f;
+    }
+
     double NowSeconds()
     {
         using namespace std::chrono;
         return duration<double>(steady_clock::now().time_since_epoch()).count();
     }
+
+    // ---------------------------------------------------------------- water field
+    void InitWaves()
+    {
+        for (int i = 0; i < kNumWaves; ++i)
+        {
+            const auto& r = kWaveRecipes[i];
+            const float len = std::sqrt(r.dirX * r.dirX + r.dirZ * r.dirZ);
+            WaveRuntime& w = g_waves[i];
+            w.dirX = r.dirX / len;
+            w.dirZ = r.dirZ / len;
+            w.k = 6.28318530718f / r.wavelength;
+            w.omega = std::sqrt(kGravity * w.k);              // deep-water dispersion
+            w.amp = r.amp;
+            w.phase0 = r.phase0;
+            // Steepness budget: sum(q_i * k_i * A_i) == kSteepness < 1 avoids loops.
+            w.q = kSteepness / (w.k * w.amp * (float)kNumWaves);
+        }
+        std::printf("[water] Gerstner waves, steepness %.2f, sampler inverts horizontal shift.\n", kSteepness);
+    }
+
+    // Gerstner evaluation at MATERIAL coordinate p: returns displaced pos + normal.
+    void GerstnerAt(float px, float pz, float t, Vec3* outPos, Vec3* outNormal)
+    {
+        float sx = 0, sy = 0, sz = 0;
+        float nx = 0, ny = 1, nz = 0;
+        for (int i = 0; i < kNumWaves; ++i)
+        {
+            const WaveRuntime& w = g_waves[i];
+            const float theta = w.k * (w.dirX * px + w.dirZ * pz) - w.omega * t + w.phase0;
+            const float s = std::sin(theta);
+            const float c = std::cos(theta);
+            sx += w.q * w.amp * w.dirX * c;
+            sz += w.q * w.amp * w.dirZ * c;
+            sy += w.amp * s;
+            nx -= w.k * w.amp * w.dirX * c;
+            ny -= w.q * w.k * w.amp * s;
+            nz -= w.k * w.amp * w.dirZ * c;
+        }
+        *outPos = { px + sx, sy, pz + sz };
+        *outNormal = Normalize({ nx, ny, nz });
+    }
+
+    // World-space query: invert the horizontal displacement by fixed-point
+    // iteration, then evaluate. This is what buoyancy calls every tick.
+    void SampleWaterWorld(float wx, float wz, float t, float* outHeight, Vec3* outNormal)
+    {
+        float px = wx, pz = wz;
+        for (int it = 0; it < 3; ++it)
+        {
+            float sx = 0, sz = 0;
+            for (int i = 0; i < kNumWaves; ++i)
+            {
+                const WaveRuntime& w = g_waves[i];
+                const float theta = w.k * (w.dirX * px + w.dirZ * pz) - w.omega * t + w.phase0;
+                const float c = std::cos(theta);
+                sx += w.q * w.amp * w.dirX * c;
+                sz += w.q * w.amp * w.dirZ * c;
+            }
+            px = wx - sx;
+            pz = wz - sz;
+        }
+        Vec3 pos, n;
+        GerstnerAt(px, pz, t, &pos, &n);
+        *outHeight = pos.y;
+        *outNormal = n;
+    }
+
+    // ---------------------------------------------------------------- rigid body
+    struct HullSample { Vec3 local; float weight; };
+    struct Body
+    {
+        Vec3 pos, vel, angVel;
+        Quat q;
+        float mass;
+        Vec3 inertia;          // body-space diagonal (box)
+        float halfW, halfH, halfD;
+        HullSample samples[5];
+    };
+
+    Body g_body;
+    float g_simTime = 0.0f;
+    float g_physAcc = 0.0f;
+    uint32_t g_randState = 123456789u;
+
+    float Rand01()
+    {
+        g_randState = g_randState * 1664525u + 1013904223u;
+        return (float)(g_randState >> 8) / 16777216.0f;
+    }
+
+    void DropBody()
+    {
+        Body& b = g_body;
+        b.pos = { 1.5f, 1.6f, 1.0f };
+        b.vel = { 0, 0, 0 };
+        b.angVel = { (Rand01() - 0.5f) * 1.5f, (Rand01() - 0.5f) * 1.5f, (Rand01() - 0.5f) * 1.5f };
+        b.q = QuatNormalize(QuatMul(QuatFromAxisAngle({ 1, 0, 0 }, (Rand01() - 0.5f) * 0.6f),
+            QuatFromAxisAngle({ 0, 0, 1 }, (Rand01() - 0.5f) * 0.6f)));
+        std::printf("[body] dropped at t=%.2f s\n", g_simTime);
+    }
+
+    void InitBody()
+    {
+        const float w = 0.9f, h = 0.7f, d = 0.9f;
+        const float volume = w * h * d;
+        Body& b = g_body;
+        b.halfW = w * 0.5f; b.halfH = h * 0.5f; b.halfD = d * 0.5f;
+        b.mass = kRhoWater * volume * 0.45f;    // floats ~45% submerged
+        b.inertia = { b.mass / 12.0f * (h * h + d * d),
+                      b.mass / 12.0f * (w * w + d * d),
+                      b.mass / 12.0f * (w * w + h * h) };
+        const float y = -b.halfH;
+        b.samples[0] = { { -b.halfW * 0.8f, y, -b.halfD * 0.8f }, 0.18f };
+        b.samples[1] = { {  b.halfW * 0.8f, y, -b.halfD * 0.8f }, 0.18f };
+        b.samples[2] = { {  b.halfW * 0.8f, y,  b.halfD * 0.8f }, 0.18f };
+        b.samples[3] = { { -b.halfW * 0.8f, y,  b.halfD * 0.8f }, 0.18f };
+        b.samples[4] = { { 0.0f, y, 0.0f }, 0.28f };
+        std::printf("[body] crate %.1fx%.1fx%.1f m, mass %.0f kg, target submersion 45%%. R = redrop.\n",
+            w, h, d, b.mass);
+        DropBody();
+    }
+
+
+
+    void StepBody(float dt)
+    {
+        Body& b = g_body;
+        Vec3 X, Y, Z;
+        QuatAxes(b.q, X, Y, Z);
+
+        Vec3 F = { 0.0f, -kGravity * b.mass, 0.0f };
+        Vec3 T = { 0, 0, 0 };
+
+        for (int i = 0; i < 5; ++i)
+        {
+            const Vec3& s = b.samples[i].local;
+            const Vec3 r = X * s.x + Y * s.y + Z * s.z;
+            const Vec3 wpos = b.pos + r;
+
+            float wh = 0; Vec3 wn;
+            SampleWaterWorld(wpos.x, wpos.z, g_simTime, &wh, &wn);
+            const float depth = wh - wpos.y;
+            if (depth <= 0.0f) continue;
+
+            const float frac = depth < (b.halfH * 2.0f) ? depth / (b.halfH * 2.0f) : 1.0f;
+            const float volume = (b.halfW * 2) * (b.halfH * 2) * (b.halfD * 2);
+            Vec3 Fs = { 0.0f, kRhoWater * kGravity * volume * b.samples[i].weight * frac, 0.0f };
+
+            // Drag at the sample point (includes rotational velocity -> angular damping).
+            const Vec3 vpt = b.vel + Cross(b.angVel, r);
+            const float speed = Length(vpt);
+            const float c = (90.0f + 25.0f * speed) * b.samples[i].weight;
+            Fs = Fs - vpt * c;
+
+            F = F + Fs;
+            T = T + Cross(r, Fs);
+        }
+
+        // Linear integrate (semi-implicit Euler).
+        b.vel = b.vel + F * (dt / b.mass);
+        if (Length(b.vel) > 30.0f) b.vel = Normalize(b.vel) * 30.0f;
+        b.pos = b.pos + b.vel * dt;
+
+        // Rotational integrate: Euler's equations in BODY space.
+        const Vec3 tb = { Dot(T, X), Dot(T, Y), Dot(T, Z) };
+        Vec3 wb = { Dot(b.angVel, X), Dot(b.angVel, Y), Dot(b.angVel, Z) };
+        const Vec3 Iw = { wb.x * b.inertia.x, wb.y * b.inertia.y, wb.z * b.inertia.z };
+        const Vec3 gyro = Cross(wb, Iw);
+        Vec3 alpha = { (tb.x - gyro.x) / b.inertia.x,
+                       (tb.y - gyro.y) / b.inertia.y,
+                       (tb.z - gyro.z) / b.inertia.z };
+        wb = wb + alpha * dt;
+        wb = wb * std::exp(-0.5f * dt);
+        if (Length(wb) > 12.0f) wb = Normalize(wb) * 12.0f;
+        b.angVel = X * wb.x + Y * wb.y + Z * wb.z;
+
+        const Quat wq = { b.angVel.x, b.angVel.y, b.angVel.z, 0.0f };
+        const Quat dq = QuatMul(wq, b.q);
+        b.q = QuatNormalize({ b.q.x + dq.x * 0.5f * dt, b.q.y + dq.y * 0.5f * dt,
+                              b.q.z + dq.z * 0.5f * dt, b.q.w + dq.w * 0.5f * dt });
+    }
+
+    // ---------------------------------------------------------------- graphics
+    struct Graphics
+    {
+        ComPtr<ID3D12Device>              device;
+        ComPtr<ID3D12CommandQueue>        queue;
+        ComPtr<ID3D12CommandAllocator>    allocator;
+        ComPtr<ID3D12GraphicsCommandList> cmdList;
+        ComPtr<IDXGISwapChain3>           swapChain;
+        ComPtr<ID3D12DescriptorHeap>      rtvHeap;
+        ComPtr<ID3D12DescriptorHeap>      dsvHeap;
+        ComPtr<ID3D12Resource>            depthTex;
+        ComPtr<ID3D12RootSignature>       rootSig;
+        ComPtr<ID3D12PipelineState>       psoSolid;
+        ComPtr<ID3D12PipelineState>       psoWire;
+        ComPtr<ID3D12PipelineState>       psoCrate;
+        ComPtr<ID3D12Resource>            vertexBuffer;
+        ComPtr<ID3D12Resource>            indexBuffer;
+        ComPtr<ID3D12Resource>            crateVB;
+        ComPtr<ID3D12Resource>            crateIB;
+        ComPtr<ID3D12Fence>               fence;
+        D3D12_VERTEX_BUFFER_VIEW          vbv{};
+        D3D12_INDEX_BUFFER_VIEW           ibv{};
+        D3D12_VERTEX_BUFFER_VIEW          cvbv{};
+        D3D12_INDEX_BUFFER_VIEW           cibv{};
+        HANDLE fenceEvent = nullptr;
+        void* vbMapped = nullptr;
+        UINT64 fenceValue = 0;
+        UINT   rtvIncrement = 0;
+        UINT   frameIndex = 0;
+        UINT   indexCount = 0;
+        bool   wireframe = false;
+        bool   prevF1 = false;
+        bool   prevR = false;
+        float  view[16] = {}, proj[16] = {};
+        float  rootConstants[56] = {};
+        std::vector<float> baseX, baseZ;
+    } g;
 
     LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
@@ -133,53 +363,6 @@ namespace {
         }
     }
 
-    // ---------------------------------------------------------------- water sim
-    void InitWaves()
-    {
-        for (const auto& r : kWaveRecipes)
-        {
-            const float len = std::sqrt(r.dirX * r.dirX + r.dirZ * r.dirZ);
-            WaveRuntime w{};
-            w.dirX = r.dirX / len;
-            w.dirZ = r.dirZ / len;
-            w.k = 6.28318530718f / r.wavelength;          // k = 2*pi / lambda
-            w.omega = std::sqrt(kGravity * w.k);          // Deep-water dispersion!
-            w.amp = r.amp;
-            w.phase0 = r.phase0;
-            g_waves.push_back(w);
-        }
-        std::printf("[water] %zu sine components, dispersion omega=sqrt(g*k).\n", g_waves.size());
-    }
-
-    // Height + analytic derivatives -> position + normal, written straight into
-    // the persistently-mapped upload buffer.
-    void UpdateWater(double t)
-    {
-        Vertex* dst = (Vertex*)g.vbMapped;
-        const size_t count = g.baseX.size();
-        const float tf = (float)t;
-        for (size_t i = 0; i < count; ++i)
-        {
-            const float x = g.baseX[i];
-            const float z = g.baseZ[i];
-            float h = 0.0f, dhx = 0.0f, dhz = 0.0f;
-            for (const auto& w : g_waves)
-            {
-                const float phase = w.k * (w.dirX * x + w.dirZ * z) - w.omega * tf + w.phase0;
-                const float s = std::sin(phase);
-                const float c = std::cos(phase);
-                h += w.amp * s;
-                dhx += w.amp * w.k * w.dirX * c;
-                dhz += w.amp * w.k * w.dirZ * c;
-            }
-            const float invLen = 1.0f / std::sqrt(dhx * dhx + 1.0f + dhz * dhz);
-            Vertex& v = dst[i];
-            v.px = x;  v.py = h;  v.pz = z;
-            v.nx = -dhx * invLen;  v.ny = invLen;  v.nz = -dhz * invLen;
-        }
-    }
-
-    // ---------------------------------------------------------------- D3D helpers
     ComPtr<ID3DBlob> CompileShader(const wchar_t* path, const char* entry, const char* target)
     {
         ComPtr<ID3DBlob> code, errors;
@@ -249,6 +432,20 @@ namespace {
         ComPtr<ID3D12PipelineState> pso;
         g.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso));
         return pso;
+    }
+
+    void UpdateWater(float t)
+    {
+        Vertex* dst = (Vertex*)g.vbMapped;
+        const size_t count = g.baseX.size();
+        for (size_t i = 0; i < count; ++i)
+        {
+            Vec3 pos, n;
+            GerstnerAt(g.baseX[i], g.baseZ[i], t, &pos, &n);
+            Vertex& v = dst[i];
+            v.px = pos.x; v.py = pos.y; v.pz = pos.z;
+            v.nx = n.x;   v.ny = n.y;   v.nz = n.z;
+        }
     }
 
     bool InitGraphics(HWND hwnd)
@@ -342,9 +539,9 @@ namespace {
         g.device->CreateDepthStencilView(g.depthTex.Get(), nullptr,
             g.dsvHeap->GetCPUDescriptorHandleForHeapStart());
 
-        // --- Root signature: 24 root constants (mvp + light + camera/time). ---
+        // Root signature: 56 root constants (mvpWater | mvpModel | model | light | cam).
         D3D12_ROOT_CONSTANTS rc{};
-        rc.Num32BitValues = 24;
+        rc.Num32BitValues = 56;
         rc.ShaderRegister = 0;
         rc.RegisterSpace = 0;
         D3D12_ROOT_PARAMETER rp{};
@@ -366,16 +563,18 @@ namespace {
             sigBlob->GetBufferSize(), IID_PPV_ARGS(&g.rootSig))))
             return false;
 
-        ComPtr<ID3DBlob> vs = CompileShader(L"water_vs.hlsl", "main", "vs_5_0");
-        ComPtr<ID3DBlob> ps = CompileShader(L"water_ps.hlsl", "main", "ps_5_0");
-        if (!vs || !ps) return false;
+        ComPtr<ID3DBlob> vsWater = CompileShader(L"water_vs.hlsl", "main", "vs_5_0");
+        ComPtr<ID3DBlob> vsModel = CompileShader(L"water_vs.hlsl", "mainModel", "vs_5_0");
+        ComPtr<ID3DBlob> psWater = CompileShader(L"water_ps.hlsl", "main", "ps_5_0");
+        ComPtr<ID3DBlob> psCrate = CompileShader(L"water_ps.hlsl", "psCrate", "ps_5_0");
+        if (!vsWater || !vsModel || !psWater || !psCrate) return false;
 
-        g.psoSolid = MakePso(vs.Get(), ps.Get(), D3D12_FILL_MODE_SOLID);
-        g.psoWire = MakePso(vs.Get(), ps.Get(), D3D12_FILL_MODE_WIREFRAME);
-        if (!g.psoSolid || !g.psoWire) return false;
-        std::printf("[gfx] PSOs created (solid + wireframe, F1 toggles).\n");
+        g.psoSolid = MakePso(vsWater.Get(), psWater.Get(), D3D12_FILL_MODE_SOLID);
+        g.psoWire = MakePso(vsWater.Get(), psWater.Get(), D3D12_FILL_MODE_WIREFRAME);
+        g.psoCrate = MakePso(vsModel.Get(), psCrate.Get(), D3D12_FILL_MODE_SOLID);
+        if (!g.psoSolid || !g.psoWire || !g.psoCrate) return false;
+        std::printf("[gfx] PSOs: water solid/wire + crate. F1 wireframe, R redrop.\n");
 
-        // --- Grid topology (static indices; vertices animate every frame). ---
         const int n = kCells + 1;
         g.baseX.reserve((size_t)n * n);
         g.baseZ.reserve((size_t)n * n);
@@ -399,11 +598,11 @@ namespace {
             }
 
         const UINT64 vbSize = (UINT64)g.baseX.size() * sizeof(Vertex);
-        g.vertexBuffer = CreateUploadBuffer(g.device.Get(), nullptr, vbSize);  // No initial data.
+        g.vertexBuffer = CreateUploadBuffer(g.device.Get(), nullptr, vbSize);
         g.indexBuffer = CreateUploadBuffer(g.device.Get(), indices.data(),
             (UINT64)indices.size() * sizeof(uint16_t));
         if (!g.vertexBuffer || !g.indexBuffer) return false;
-        g.vertexBuffer->Map(0, nullptr, &g.vbMapped);   // Persistent map: write every frame.
+        g.vertexBuffer->Map(0, nullptr, &g.vbMapped);
 
         g.vbv.BufferLocation = g.vertexBuffer->GetGPUVirtualAddress();
         g.vbv.StrideInBytes = sizeof(Vertex);
@@ -412,28 +611,84 @@ namespace {
         g.ibv.Format = DXGI_FORMAT_R16_UINT;
         g.ibv.SizeInBytes = (UINT)indices.size() * sizeof(uint16_t);
         g.indexCount = (UINT)indices.size();
-        std::printf("[gfx] Grid: %zu verts, %u indices.\n", g.baseX.size(), g.indexCount);
 
-        float view[16], proj[16];
-        Mat4LookAtLH({ 0.0f, 2.5f, -9.0f }, { 0.0f, 0.0f, 2.0f }, { 0.0f, 1.0f, 0.0f }, view);
-        Mat4PerspectiveLH(1.05f, (float)kWidth / (float)kHeight, 0.1f, 200.0f, proj);
-        Mat4Multiply(view, proj, g.mvp);
+        // --- Crate mesh: 24 verts (4 per face, real normals), 36 indices. ---
+        const float ex = g_body.halfW, ey = g_body.halfH, ez = g_body.halfD;
+        struct Face { Vec3 n; Vec3 u; Vec3 v; };
+        const Face faces[6] = {
+            { { 0, 0,-1 }, { 1, 0, 0 }, { 0, 1, 0 } },
+            { { 0, 0, 1 }, { 1, 0, 0 }, { 0, 1, 0 } },
+            { {-1, 0, 0 }, { 0, 0, 1 }, { 0, 1, 0 } },
+            { { 1, 0, 0 }, { 0, 0, 1 }, { 0, 1, 0 } },
+            { { 0,-1, 0 }, { 1, 0, 0 }, { 0, 0, 1 } },
+            { { 0, 1, 0 }, { 1, 0, 0 }, { 0, 0, 1 } },
+        };
+        std::vector<Vertex> cverts;
+        std::vector<uint16_t> cindices;
+        for (int f = 0; f < 6; ++f)
+        {
+            const Vec3 n = faces[f].n, u = faces[f].u, v = faces[f].v;
+            const Vec3 c = n;   // face center = normal * half-extent along n
+            const Vec3 center = { c.x * ex, c.y * ey, c.z * ez };
+            const Vec3 eu = { u.x * ex, u.y * ey, u.z * ez };
+            const Vec3 ev = { v.x * ex, v.y * ey, v.z * ez };
+            const uint16_t base = (uint16_t)cverts.size();
+            const float su[4] = { -1, -1, 1, 1 };
+            const float sv[4] = { -1, 1, 1, -1 };
+            for (int k = 0; k < 4; ++k)
+            {
+                Vertex vtx{};
+                vtx.px = center.x + eu.x * su[k] + ev.x * sv[k];
+                vtx.py = center.y + eu.y * su[k] + ev.y * sv[k];
+                vtx.pz = center.z + eu.z * su[k] + ev.z * sv[k];
+                vtx.nx = n.x; vtx.ny = n.y; vtx.nz = n.z;
+                cverts.push_back(vtx);
+            }
+            const uint16_t b0 = base;
+            const uint16_t b1 = (uint16_t)(base + 1);
+            const uint16_t b2 = (uint16_t)(base + 2);
+            const uint16_t b3 = (uint16_t)(base + 3);
+            cindices.insert(cindices.end(), { b0, b1, b2, b0, b2, b3 });
+        }
+        g.crateVB = CreateUploadBuffer(g.device.Get(), cverts.data(),
+            (UINT64)cverts.size() * sizeof(Vertex));
+        g.crateIB = CreateUploadBuffer(g.device.Get(), cindices.data(),
+            (UINT64)cindices.size() * sizeof(uint16_t));
+        if (!g.crateVB || !g.crateIB) return false;
+        g.cvbv.BufferLocation = g.crateVB->GetGPUVirtualAddress();
+        g.cvbv.StrideInBytes = sizeof(Vertex);
+        g.cvbv.SizeInBytes = (UINT)(cverts.size() * sizeof(Vertex));
+        g.cibv.BufferLocation = g.crateIB->GetGPUVirtualAddress();
+        g.cibv.Format = DXGI_FORMAT_R16_UINT;
+        g.cibv.SizeInBytes = (UINT)(cindices.size() * sizeof(uint16_t));
+
+        Mat4LookAtLH({ 0.0f, 2.5f, -9.0f }, { 0.6f, 0.0f, 2.0f }, { 0.0f, 1.0f, 0.0f }, g.view);
+        Mat4PerspectiveLH(1.05f, (float)kWidth / (float)kHeight, 0.1f, 200.0f, g.proj);
 
         if (FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence)))) return false;
         g.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        std::printf("[gfx] Grid: %zu verts, %u indices; crate: %zu verts.\n",
+            g.baseX.size(), g.indexCount, cverts.size());
         return true;
     }
 
-    void RenderFrame(double timeSec)
+    void RenderFrame(float t)
     {
-        UpdateWater(timeSec);   // CPU writes straight into the mapped buffer.
+        UpdateWater(t);
 
-        // Pack root constants: mvp | lightDir | camPos+time.
-        for (int i = 0; i < 16; ++i) g.rootConstants[i] = g.mvp[i];
+        float mvpWater[16], model[16], mvpModel[16], tmp[16];
+        Mat4Multiply(g.view, g.proj, mvpWater);
+        Mat4FromQuatPos(g_body.q, g_body.pos, model);
+        Mat4Multiply(model, g.view, tmp);
+        Mat4Multiply(tmp, g.proj, mvpModel);
+
+        float* rc = g.rootConstants;
+        for (int i = 0; i < 16; ++i) rc[i] = mvpWater[i];
+        for (int i = 0; i < 16; ++i) rc[16 + i] = mvpModel[i];
+        for (int i = 0; i < 16; ++i) rc[32 + i] = model[i];
         const Vec3 L = Normalize({ 0.35f, 0.65f, -0.50f });
-        g.rootConstants[16] = L.x; g.rootConstants[17] = L.y; g.rootConstants[18] = L.z; g.rootConstants[19] = 0.0f;
-        g.rootConstants[20] = 0.0f; g.rootConstants[21] = 2.5f; g.rootConstants[22] = -9.0f;
-        g.rootConstants[23] = (float)timeSec;
+        rc[48] = L.x; rc[49] = L.y; rc[50] = L.z; rc[51] = 0.0f;
+        rc[52] = 0.0f; rc[53] = 2.5f; rc[54] = -9.0f; rc[55] = t;
 
         g.allocator->Reset();
         g.cmdList->Reset(g.allocator.Get(), nullptr);
@@ -459,10 +714,7 @@ namespace {
 
         g.cmdList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         g.cmdList->SetGraphicsRootSignature(g.rootSig.Get());
-        g.cmdList->SetPipelineState(g.wireframe ? g.psoWire.Get() : g.psoSolid.Get());
         g.cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        g.cmdList->IASetVertexBuffers(0, 1, &g.vbv);
-        g.cmdList->IASetIndexBuffer(&g.ibv);
 
         D3D12_VIEWPORT vp{};
         vp.Width = (float)kWidth;
@@ -471,9 +723,19 @@ namespace {
         D3D12_RECT scissor{ 0, 0, (LONG)kWidth, (LONG)kHeight };
         g.cmdList->RSSetViewports(1, &vp);
         g.cmdList->RSSetScissorRects(1, &scissor);
+        g.cmdList->SetGraphicsRoot32BitConstants(0, 56, rc, 0);
 
-        g.cmdList->SetGraphicsRoot32BitConstants(0, 24, g.rootConstants, 0);
+        // Water pass.
+        g.cmdList->SetPipelineState(g.wireframe ? g.psoWire.Get() : g.psoSolid.Get());
+        g.cmdList->IASetVertexBuffers(0, 1, &g.vbv);
+        g.cmdList->IASetIndexBuffer(&g.ibv);
         g.cmdList->DrawIndexedInstanced(g.indexCount, 1, 0, 0, 0);
+
+        // Crate pass.
+        g.cmdList->SetPipelineState(g.psoCrate.Get());
+        g.cmdList->IASetVertexBuffers(0, 1, &g.cvbv);
+        g.cmdList->IASetIndexBuffer(&g.cibv);
+        g.cmdList->DrawIndexedInstanced(36, 1, 0, 0, 0);
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
@@ -514,6 +776,7 @@ int main()
 {
     std::printf("CFD_but_actually_fun: opening window...\n");
     InitWaves();
+    InitBody();
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -539,7 +802,7 @@ int main()
         return 1;
     }
 
-    const double start = NowSeconds();
+    double prev = NowSeconds();
     bool running = true;
     while (running)
     {
@@ -551,7 +814,6 @@ int main()
         }
         if (!running) break;
 
-        // F1 edge-detect: toggle wireframe debug view.
         const bool f1Down = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
         if (f1Down && !g.prevF1)
         {
@@ -560,7 +822,24 @@ int main()
         }
         g.prevF1 = f1Down;
 
-        RenderFrame(NowSeconds() - start);
+        const bool rDown = (GetAsyncKeyState('R') & 0x8000) != 0;
+        if (rDown && !g.prevR) DropBody();
+        g.prevR = rDown;
+
+        // Fixed-timestep physics: frame-rate independent, deterministic.
+        const double now = NowSeconds();
+        double frameDt = now - prev;
+        prev = now;
+        if (frameDt > 0.25) frameDt = 0.25;
+        g_physAcc += (float)frameDt;
+        while (g_physAcc >= kSimDt)
+        {
+            StepBody(kSimDt);
+            g_simTime += kSimDt;
+            g_physAcc -= kSimDt;
+        }
+
+        RenderFrame(g_simTime);
     }
 
     ShutdownGraphics();
