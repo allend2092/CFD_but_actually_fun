@@ -244,5 +244,30 @@ void computePose(const VehicleState& s, const FilterState& f, PoseResult& out)
     out.angles[JA_NeckPitch]  = headPitch;
 }
 
+// ---------------------------------------------------------------------------
+// Static rider pose: rigid copy of the rest pose attached to the hull.
+// ---------------------------------------------------------------------------
+void computeStaticPose(const VehicleState& s, PoseResult& out)
+{
+    const Mat3 hullBasis = finiteMat3(mat3FromFlat(s.hullBasis));
+    const Vec3 hullPos = finiteVec({ s.hullPosition[0], s.hullPosition[1], s.hullPosition[2] },
+                                   Vec3{ 0.0f, 0.0f, 0.0f });
+
+    // Rest pose in the hull-local frame: IK pose at identity hull with a
+    // neutral filter (zero lag) and zero throttle/steer.
+    VehicleState rest{};
+    rest.hullBasis[0] = 1.0f; rest.hullBasis[4] = 1.0f; rest.hullBasis[8] = 1.0f;
+    FilterState restFilter{};   // filteredHullY = 0, hullPos.y = 0 -> zero lag
+    PoseResult restPose{};
+    computePose(rest, restFilter, restPose);
+
+    // Rigidly attach every joint to the live hull frame.
+    for (int j = 0; j < J_Count; ++j) {
+        out.joint[j].origin = vadd(hullPos, m3mulv(hullBasis, restPose.joint[j].origin));
+        out.joint[j].basis  = m3mul(hullBasis, restPose.joint[j].basis);
+    }
+    for (int a = 0; a < JA_Count; ++a) out.angles[a] = (a == JA_SpineRoll || a == JA_SpinePitch) ? 0.0f : restPose.angles[a];
+}
+
 }  // namespace detail
 }  // namespace jetski

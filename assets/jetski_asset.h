@@ -45,6 +45,12 @@ const MeshTopology& rig_topology(const Rig&);
 // topology.vertexCount. No allocations, no exceptions, deterministic.
 void  rig_pose(const Rig&, const VehicleState&, std::span<AssetVertex> out);
 
+// Static-rider pose: the rider is a rigid copy of its rest pose attached to
+// the hull (no IK, no hip filter, no lean/squat/steer). Same contract as
+// rig_pose; does NOT advance the hip filter, so switching back to rig_pose
+// resumes smoothly.
+void  rig_pose_static(const Rig&, const VehicleState&, std::span<AssetVertex> out);
+
 // Debug/inspection only (used by the test harness and by humans):
 bool  export_obj(const MeshTopology&, std::span<const AssetVertex>, const char* path);
 

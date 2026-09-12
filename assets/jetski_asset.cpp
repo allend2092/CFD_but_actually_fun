@@ -365,6 +365,28 @@ void rig_pose(const Rig& r, const VehicleState& s, std::span<AssetVertex> out)
     }
 }
 
+void rig_pose_static(const Rig& r, const VehicleState& s, std::span<AssetVertex> out)
+{
+    // Static rider: rigid rest pose attached to the hull. Does NOT advance the
+    // hip filter, so switching back to rig_pose resumes without a jump.
+    detail::PoseResult pose{};
+    detail::computeStaticPose(s, pose);
+
+    const std::size_t n = (out.size() < r.vertexJoint.size()) ? out.size() : r.vertexJoint.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        const detail::JointXf& xf = pose.joint[r.vertexJoint[i]];
+        const AssetVertex& rv = r.rest[i];
+        AssetVertex& ov = out[i];
+        const Vec3 lp{ rv.position[0], rv.position[1], rv.position[2] };
+        const Vec3 wp = detail::vadd(xf.origin, detail::m3mulv(xf.basis, lp));
+        ov.position[0] = wp.x; ov.position[1] = wp.y; ov.position[2] = wp.z;
+        const Vec3 ln{ rv.normal[0], rv.normal[1], rv.normal[2] };
+        const Vec3 wn = detail::safeNormalize(detail::m3mulv(xf.basis, ln), ln);
+        ov.normal[0] = wn.x; ov.normal[1] = wn.y; ov.normal[2] = wn.z;
+        ov.color[0] = rv.color[0]; ov.color[1] = rv.color[1]; ov.color[2] = rv.color[2];
+    }
+}
+
 // Debug only (test harness). Reads the Rig's current filter state (as advanced
 // by the most recent rig_pose call) without advancing it. Defined in
 // namespace detail to match the declarations in jetski_internal.h.

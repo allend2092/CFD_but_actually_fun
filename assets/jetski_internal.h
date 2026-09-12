@@ -144,6 +144,13 @@ void advanceFilter(FilterState& f, float time, float hullY);
 // filter. `f` is read as-is. Deterministic and allocation-free.
 void computePose(const VehicleState& state, const FilterState& f, PoseResult& out);
 
+// Static rider pose: the rest pose (identity hull, neutral filter, zero
+// throttle/steer) rigidly attached to the live hull. No IK, no filter lag,
+// no lean/squat/steer — the rider moves exactly with the jet-ski. Deterministic
+// and allocation-free. Safe at any heading (unlike computePose, whose
+// atan2-based hull roll/pitch extraction degenerates near +/-180 deg yaw).
+void computeStaticPose(const VehicleState& state, PoseResult& out);
+
 // Debug only (test harness): joint angles / world joint positions for a state,
 // using the Rig's CURRENT filter state (as advanced by the most recent
 // rig_pose call). Does not advance the filter. out must have JA_Count floats
@@ -173,7 +180,7 @@ struct Rig {
     std::vector<AssetVertex>        rest;       // rest-pose vertices (one per vertex)
     std::vector<MeshTopology::Part> partRecs;   // one per part (topo.parts points here)
     std::vector<int>                vertexJoint;// per-vertex joint index (for posing)
-    MeshTopology                    topo;       // points into indices/partRecs
+    MeshTopology                    topo{};       // points into indices/partRecs
     mutable detail::FilterState     filter;     // hip low-pass state (lives in the Rig)
 };
 

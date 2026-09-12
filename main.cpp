@@ -1,4 +1,4 @@
-#define NOMINMAX
+﻿#define NOMINMAX
 #include <windows.h>
 
 // main.cpp
@@ -35,7 +35,7 @@ namespace {
     constexpr UINT kHeight = 720;
 
     constexpr int   kCells = 128;
-    constexpr float kHalf = 10.0f;
+    constexpr float kHalf = 20.0f;   // radius of the boat-locked water patch (m)
     constexpr float kGravity = 9.81f;
     constexpr float kSimDt = 1.0f / 120.0f;
     constexpr float kSteepness = 0.80f;
@@ -44,10 +44,10 @@ namespace {
 
     struct WaveRecipe { float dirX, dirZ, wavelength, amp, phase0; };
     constexpr WaveRecipe kWaveRecipes[] = {
-        {  1.00f, 0.15f, 7.0f, 0.32f, 0.0f },
-        {  0.80f, 0.60f, 4.3f, 0.18f, 1.7f },
-        {  0.35f, 1.00f, 2.6f, 0.10f, 3.1f },
-        { -0.25f, 0.95f, 1.6f, 0.05f, 4.2f },
+     {  1.00f, 0.15f, 14.0f, 0.55f, 0.0f },  // Long, tall primary swell (highly visible)
+     {  0.80f, 0.60f,  8.0f, 0.30f, 1.7f },  // Medium cross-chop
+     {  0.35f, 1.00f,  4.5f, 0.18f, 3.1f },  // Shorter wind waves
+     { -0.25f, 0.95f,  2.5f, 0.10f, 4.2f },  // Small detail ripples
     };
     constexpr int kNumWaves = 4;
 
@@ -56,6 +56,12 @@ namespace {
 
     float g_throttle = 0.0f;
     float g_steer = 0.0f;
+
+    // Rider model: true = static rider (rigid copy of the rest pose attached to
+    // the hull — safe at any heading); false = full IK physics. P key toggles.
+    // Default STATIC until the IK's hull roll/pitch extraction is fixed for
+    // large heading changes (it degenerates near +/-180 deg yaw).
+    bool g_riderStatic = true;
 
     // ---------------------------------------------------------------- math types
     struct Vec3 { float x, y, z; };
@@ -144,6 +150,30 @@ namespace {
         return duration<double>(steady_clock::now().time_since_epoch()).count();
     }
 
+    // ---------------------------------------------------------------- camera
+    struct ChaseCamera {
+        Vec3 pos;
+        Vec3 vel;
+        Vec3 lookAt;
+        Vec3 lookAtVel;
+
+        float dist = 5.5f;       // Distance behind the hull
+        float height = 2.2f;     // Height above the hull
+        float lookAhead = 8.0f;  // Distance ahead to look (anticipates turns)
+
+        float posStiffness = 6.0f;
+        float posDamping = 4.5f;
+        float lookStiffness = 10.0f;
+        float lookDamping = 6.0f;
+
+        float shakeTime = 0.0f;
+        Vec3 fwd = { 0.0f, 0.0f, 1.0f };  // smoothed hull forward (yaw lag)
+    };
+    ChaseCamera g_cam;
+    float g_viewMat[16] = {};   // view matrix, written by UpdateCamera every frame
+
+
+
     // ---------------------------------------------------------------- water field
     void InitWaves()
     {
@@ -211,11 +241,16 @@ namespace {
     boat::WakeField g_wake(26.0f, 128, 2.6f, 1.4f, 0.9f);   // S,N,c,mu,sponge
     float g_simTime = 0.0f;
     float g_physAcc = 0.0f;
+    float g_printAcc = 0.0f;
+
+    void InitCamera();
+    void UpdateCamera(float dt, float t);
 
     void ResetBoat()
     {
-        g_boat.reset(1.5f, 1.6f, 1.0f);
+        g_boat.reset(0.0f, 0.8f, 0.0f);
         g_wake.clear();
+        InitCamera();
     }
 
   void StepBoat(float dt)
@@ -232,9 +267,23 @@ namespace {
             wh[i] = h + g_wake.sample(sw.x - oldPos.x, sw.z - oldPos.z);
         }
 
-        // 2) advance the boat (real hull + planing + trim)
+        // 2) advance the boat (real hull + planing + trim), guarded
         g_boat.setControls(g_throttle, g_steer);
-        g_boat.step(dt, wh);
+        bool whOk = true;
+        for (int i = 0; i < g_boat.nSamples(); ++i) if (!std::isfinite(wh[i])) whOk = false;
+        if (whOk) g_boat.step(dt, wh);
+        // Watchdog: self-heal instead of black-screening if the boat ever diverges
+        {
+            const boat::Vec3 pp = g_boat.pos();
+            const boat::Vec3 vv = g_boat.vel();
+            const float fin = pp.x + pp.y + pp.z + vv.x + vv.y + vv.z;
+            if (!std::isfinite(fin) || pp.y < -15.0f || pp.y > 40.0f)
+            {
+                std::printf("[watchdog] boat diverged (y=%.2f); resetting to center\n", pp.y);
+                g_boat.reset(0.0f, 0.8f, 0.0f);
+                g_wake.clear();
+            }
+        }
 
         // 3) boat-locked scroll so the wake trails the boat
         const boat::Vec3 dp = boat::vsub(g_boat.pos(), oldPos);
@@ -261,6 +310,87 @@ namespace {
         // 5) advance the wake field
         g_wake.step(dt);
     }
+
+  void InitCamera()
+  {
+      jetski::VehicleState vs{};
+      g_boat.vehicleState(0.0f, 0.0f, boat::Vec3{ 0, 1, 0 }, vs);
+
+      Vec3 hullX = { vs.hullBasis[0], vs.hullBasis[3], vs.hullBasis[6] };
+      Vec3 hullY = { vs.hullBasis[1], vs.hullBasis[4], vs.hullBasis[7] };
+      Vec3 hullZ = { vs.hullBasis[2], vs.hullBasis[5], vs.hullBasis[8] };
+      Vec3 hullPos = { vs.hullPosition[0], vs.hullPosition[1], vs.hullPosition[2] };
+
+      // Snap camera to ideal position on init so it doesn't fly across the ocean on frame 1
+      g_cam.pos = hullPos - hullZ * g_cam.dist + hullY * g_cam.height;
+      g_cam.vel = { 0, 0, 0 };
+      g_cam.lookAt = hullPos + hullZ * g_cam.lookAhead;
+      g_cam.lookAtVel = { 0, 0, 0 };
+      g_cam.fwd = hullZ;
+  }
+
+  void UpdateCamera(float dt, float t)
+  {
+      jetski::VehicleState vs{};
+      g_boat.vehicleState(t, 0.0f, boat::Vec3{ 0, 1, 0 }, vs);
+
+      Vec3 hullX = { vs.hullBasis[0], vs.hullBasis[3], vs.hullBasis[6] };
+      Vec3 hullY = { vs.hullBasis[1], vs.hullBasis[4], vs.hullBasis[7] };
+      Vec3 hullZ = { vs.hullBasis[2], vs.hullBasis[5], vs.hullBasis[8] };
+      Vec3 hullPos = { vs.hullPosition[0], vs.hullPosition[1], vs.hullPosition[2] };
+
+      // A spring-damper tracking a moving target lags by v*(damping/stiffness).
+      // Feed the boat velocity forward to cancel it exactly at steady speed;
+      // the spring still smooths turns and wave impacts.
+      const Vec3 boatVel = { vs.hullVelocity[0], vs.hullVelocity[1], vs.hullVelocity[2] };
+      // Camera yaw chases hull yaw with a ~0.3 s lag: during turns the hull
+      // angles visibly across frame instead of the whole world rotating invisibly.
+      const float kF = 1.0f - std::exp(-dt / 0.30f);
+      g_cam.fwd = Normalize(g_cam.fwd + (hullZ - g_cam.fwd) * kF);
+      Vec3 idealPos = hullPos - g_cam.fwd * g_cam.dist + hullY * g_cam.height + boatVel * (g_cam.posDamping / g_cam.posStiffness);
+      Vec3 idealLook = hullPos + g_cam.fwd * g_cam.lookAhead + hullY * 0.5f + boatVel * (g_cam.lookDamping / g_cam.lookStiffness);
+
+
+      // 2. Spring-damper for position (smooth follow)
+      Vec3 posDiff = idealPos - g_cam.pos;
+      Vec3 posAccel = posDiff * g_cam.posStiffness - g_cam.vel * g_cam.posDamping;
+      g_cam.vel = g_cam.vel + posAccel * dt;
+      g_cam.pos = g_cam.pos + g_cam.vel * dt;
+
+      // 3. Spring-damper for look-at (smooth anticipation)
+      Vec3 lookDiff = idealLook - g_cam.lookAt;
+      Vec3 lookAccel = lookDiff * g_cam.lookStiffness - g_cam.lookAtVel * g_cam.lookDamping;
+      g_cam.lookAtVel = g_cam.lookAtVel + lookAccel * dt;
+      g_cam.lookAt = g_cam.lookAt + g_cam.lookAtVel * dt;
+
+      // 4. Camera shake based on wave chop and speed
+      float hGerstner; Vec3 nGerstner;
+      SampleWaterWorld(hullPos.x, hullPos.z, t, &hGerstner, &nGerstner);
+      float hWake = g_wake.sample(0.0f, 0.0f); // 0,0 in boat-locked space is hull center
+      float surfaceY = hGerstner + hWake;
+
+      float submersion = surfaceY - hullPos.y;
+      float speed = g_boat.speed();
+      float chop = std::max(0.0f, submersion) * 0.8f + std::max(0.0f, speed - 5.0f) * 0.05f;
+      chop = std::min(chop, 1.0f);
+
+      float freq = 12.0f + speed * 1.5f;
+      g_cam.shakeTime += dt * freq;
+
+      float sx = std::sin(g_cam.shakeTime * 1.3f) * std::cos(g_cam.shakeTime * 0.7f + 1.0f);
+      float sy = std::sin(g_cam.shakeTime * 1.7f + 2.0f) * std::cos(g_cam.shakeTime * 1.1f);
+      float sz = std::sin(g_cam.shakeTime * 0.9f + 3.0f) * std::cos(g_cam.shakeTime * 1.5f);
+
+      float shakeScale = chop * 0.12f;
+      Vec3 shakeOffset = { sx * shakeScale, sy * shakeScale * 0.5f, sz * shakeScale };
+
+      Vec3 finalPos = g_cam.pos + shakeOffset;
+      Vec3 finalLook = g_cam.lookAt;
+
+      Mat4LookAtLH(finalPos, finalLook, Vec3{ 0.0f, 1.0f, 0.0f }, g_viewMat);
+  }
+
+
 
     // ---------------------------------------------------------------- graphics
     struct Graphics
@@ -301,7 +431,8 @@ namespace {
         bool   wireframe = false;
         bool   prevF1 = false;
         bool   prevR = false;
-        float  view[16] = {}, proj[16] = {};
+        bool   prevP = false;
+        float  proj[16] = {};
         float  rootConstants[64] = {};
         std::vector<float> baseX, baseZ;
 
@@ -397,9 +528,13 @@ namespace {
         const boat::Vec3 bp = g_boat.pos();
         for (size_t i = 0; i < count; ++i)
         {
+            // The GRID is boat-locked (a moving window), but the WAVES are sampled
+            // in WORLD space: the ocean stays put while the window slides over it.
+            const float wx = bp.x + g.baseX[i];
+            const float wz = bp.z + g.baseZ[i];
             Vec3 pos, n;
-            GerstnerAt(g.baseX[i], g.baseZ[i], t, &pos, &n);
-            pos.y += g_wake.sample(g.baseX[i] - bp.x, g.baseZ[i] - bp.z);  // boat-locked wake
+            GerstnerAt(wx, wz, t, &pos, &n);
+            pos.y += g_wake.sample(g.baseX[i], g.baseZ[i]);   // wake field IS boat-local
             Vertex& v = dst[i];
             v.px = pos.x; v.py = pos.y; v.pz = pos.z;
             v.nx = n.x;   v.ny = n.y;   v.nz = n.z;
@@ -659,7 +794,7 @@ namespace {
         g.jibv.Format = DXGI_FORMAT_R32_UINT;
         g.jibv.SizeInBytes = (UINT)jibSize;
 
-        Mat4LookAtLH({ 0.0f, 2.5f, -9.0f }, { 0.6f, 0.0f, 2.0f }, { 0.0f, 1.0f, 0.0f }, g.view);
+        InitCamera();
         Mat4PerspectiveLH(1.05f, (float)kWidth / (float)kHeight, 0.1f, 200.0f, g.proj);
 
         if (FAILED(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence)))) return false;
@@ -667,12 +802,13 @@ namespace {
         return true;
     }
 
-    void RenderFrame(float t)
+    void RenderFrame(float t, float dt)
     {
-        UpdateWater(t);
+        UpdateWater(t);        // write this frame's wave heights into the water VB
+        UpdateCamera(dt, t);
 
         float mvpWater[16], model[16], mvpModel[16], tmp[16];
-        Mat4Multiply(g.view, g.proj, mvpWater);
+        Mat4Multiply(g_viewMat, g.proj, mvpWater);
 
         // Fill the rider state from the boat (real hull). Support height/normal
         // under the hull center = Gerstner + wake (field coord 0 = boat center).
@@ -686,29 +822,34 @@ namespace {
         // World model matrix from the boat's basis (cols X,Y,Z) + position.
         for (int i = 0; i < 3; ++i)
             for (int j = 0; j < 3; ++j)
-                model[i * 4 + j] = vs.hullBasis[i * 3 + j];
+                model[i * 4 + j] = vs.hullBasis[j * 3 + i];   // transpose: axes into rows
         model[3] = 0; model[7] = 0; model[11] = 0;
         model[12] = vs.hullPosition[0]; model[13] = vs.hullPosition[1]; model[14] = vs.hullPosition[2];
         model[15] = 1;
 
-        jetski::rig_pose(g.rig, vs, std::span<jetski::AssetVertex>(g.posedVerts));
+        if (g_riderStatic)
+            jetski::rig_pose_static(g.rig, vs, std::span<jetski::AssetVertex>(g.posedVerts));
+        else
+            jetski::rig_pose(g.rig, vs, std::span<jetski::AssetVertex>(g.posedVerts));
         memcpy(g.jvbMapped, g.posedVerts.data(), g.posedVerts.size() * sizeof(jetski::AssetVertex));
 
-        Mat4Multiply(model, g.view, tmp);
+        Mat4Multiply(model, g_viewMat, tmp);
         Mat4Multiply(tmp, g.proj, mvpModel);
 
         float* rc = g.rootConstants;
         for (int i = 0; i < 16; ++i) rc[i] = mvpWater[i];
-        for (int i = 0; i < 16; ++i) rc[16 + i] = mvpModel[i];
-        for (int i = 0; i < 16; ++i) rc[32 + i] = model[i];
+        // Crate = static buoy at world origin: view*proj with an identity model.
+        for (int i = 0; i < 16; ++i) rc[16 + i] = mvpWater[i];
+        const float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+        for (int i = 0; i < 16; ++i) rc[32 + i] = ident[i];
         const Vec3 L = Normalize({ 0.35f, 0.65f, -0.50f });
         rc[48] = L.x; rc[49] = L.y; rc[50] = L.z; rc[51] = 0.0f;
-        rc[52] = 0.0f; rc[53] = 2.5f; rc[54] = -9.0f; rc[55] = t;
+        rc[52] = g_cam.pos.x; rc[53] = g_cam.pos.y; rc[54] = g_cam.pos.z; rc[55] = t;
         // boatState + wakeParams for the water foam (procedural V in water_ps).
-        const float fl = std::sqrt(vs.hullBasis[6] * vs.hullBasis[6] + vs.hullBasis[8] * vs.hullBasis[8]);
+        const float fl = std::sqrt(vs.hullBasis[2] * vs.hullBasis[2] + vs.hullBasis[8] * vs.hullBasis[8]);
         rc[56] = vs.hullPosition[0]; rc[57] = vs.hullPosition[2];
-        rc[58] = (fl > 1e-5f) ? vs.hullBasis[6] / fl : 0.0f;   // fwd.x (hull +Z in world)
-        rc[59] = (fl > 1e-5f) ? vs.hullBasis[8] / fl : 1.0f;   // fwd.z
+        rc[58] = (fl > 1e-5f) ? vs.hullBasis[2] / fl : 0.0f;   // fwd.x = hull Z axis, x
+        rc[59] = (fl > 1e-5f) ? vs.hullBasis[8] / fl : 1.0f;   // fwd.z = hull Z axis, z
         rc[60] = g_boat.speed(); rc[61] = g_throttle; rc[62] = 1.0f; rc[63] = t;
 
         g.allocator->Reset();
@@ -729,7 +870,7 @@ namespace {
         rtv.ptr += g.frameIndex * g.rtvIncrement;
         D3D12_CPU_DESCRIPTOR_HANDLE dsv = g.dsvHeap->GetCPUDescriptorHandleForHeapStart();
 
-        const float clearColor[4] = { 0.01f, 0.03f, 0.06f, 1.0f };
+        const float clearColor[4] = { 0.04f, 0.09f, 0.13f, 1.0f };
         g.cmdList->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
         g.cmdList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
@@ -821,6 +962,7 @@ int main()
     UpdateWindow(hwnd);
 
     if (!InitGraphics(hwnd)) return 1;
+    std::printf("Controls: W/S throttle, A/D steer, R reset to center, F1 wireframe, P rider physics (IK on/off).\n");
 
     double prev = NowSeconds();
     bool running = true;
@@ -841,6 +983,12 @@ int main()
         const bool rDown = (GetAsyncKeyState('R') & 0x8000) != 0;
         if (rDown && !g.prevR) ResetBoat();
         g.prevR = rDown;
+
+        // P = rider physics: toggles between the static rider (rigid on the
+        // hull, default) and the full IK rig.
+        const bool pDown = (GetAsyncKeyState('P') & 0x8000) != 0;
+        if (pDown && !g.prevP) g_riderStatic = !g_riderStatic;
+        g.prevP = pDown;
 
         const double now = NowSeconds();
         double frameDt = now - prev;
@@ -863,7 +1011,23 @@ int main()
             g_physAcc -= kSimDt;
         }
 
-        RenderFrame(g_simTime);
+        RenderFrame(g_simTime, (float)frameDt);
+        g_printAcc += (float)frameDt;
+        if (g_printAcc >= 2.0f)
+        {
+            g_printAcc = 0.0f;
+            const boat::Vec3 pp = g_boat.pos();
+
+            // Calculate heading from the hull's forward vector (Z axis)
+            jetski::VehicleState vsT{};
+            g_boat.vehicleState(g_simTime, 0.0f, boat::Vec3{ 0, 1, 0 }, vsT);
+            const float hdg = std::atan2(vsT.hullBasis[2], vsT.hullBasis[8]) * 57.29578f;
+
+            std::printf("[telemetry] speed %5.1f m/s  hdg %+6.1f deg  pos (%6.1f, %6.1f)  trim %+5.1f deg  roll %+5.1f deg  rider %s\n",
+                g_boat.speed(), hdg, pp.x, pp.z,
+                g_boat.trim() * 57.29578f, g_boat.roll() * 57.29578f,
+                g_riderStatic ? "STATIC" : "IK");
+        }
     }
 
     ShutdownGraphics();

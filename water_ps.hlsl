@@ -83,6 +83,9 @@ float4 main(VSOut input) : SV_Target
     float3 wf = WakeFoam(input.world);
     col = col + wf;                       // additive white in the V + at the bow
     col = lerp(col, col * 0.80 + wf, wf.r * 0.4);   // soften the crest slightly
+    // Distance fog hides the edge of the boat-locked grid -> seamless horizon
+    float fog = smoothstep(24.0, 44.0, length(input.world.xz - camPosTime.xz));
+    col = lerp(col, float3(0.04, 0.09, 0.13), fog);
     return float4(col, 1.0);
 }
 
