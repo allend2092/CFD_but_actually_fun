@@ -8,7 +8,8 @@ The goal is to learn real water physics by building a playable ocean — waves,
 buoyancy, rigid bodies, and eventually rideable craft with AI rivals — while
 keeping it *actually fun* rather than academically correct.
 
-![Milestone 5: A procedurally generated jetski and rider navigating Gerstner waves](CFD_But_Actually_Fun.png)
+![Milestone 5: A procedurally generated jetski and rider navigating Gerstner waves](CFD_But_Actually_Fun.png)  
+(boatman.png)
 
 *Milestone 5 stopping point: The local model's procedural jetski and IK-driven 
 rider meet the Gerstner ocean. The rider's hips are low-pass filtered, causing 
