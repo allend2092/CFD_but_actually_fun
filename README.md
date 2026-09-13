@@ -12,14 +12,14 @@ rider rides the Gerstner waves under a physically-motivated sky that moves with 
 
 | | |
 |---|---|
-| ![Caribbean Evening — the default sunset vista](images/sunset.png) | **Caribbean Evening** — the default vista: a low western sun, warm horizon, and a
+| ![Caribbean Evening — the default sunset vista](sunset.png) | **Caribbean Evening** — the default vista: a low western sun, warm horizon, and a
 deep blue ocean. This is what you see when you launch the app. |
 
 | | |
 |---|---|
-| ![A cloudy sky](images/cloudy.png) | **Cloudy** — overcast cloud cover and a muted, hazy grade. |
-| ![Dusk — time scrubbed toward evening](images/dusk.png) | **Dusk** — the sun scrubbed toward the horizon with `[` / `]`. |
-| ![The boat at night](images/night_boat.png) | **Night** — the boat under a near-black sky with a faint, dim horizon. |
+| ![A cloudy sky](cloudy.png) | **Cloudy** — overcast cloud cover and a muted, hazy grade. |
+| ![Dusk — time scrubbed toward evening](dusk.png) | **Dusk** — the sun scrubbed toward the horizon with `[` / `]`. |
+| ![The boat at night](night_boat.png) | **Night** — the boat under a near-black sky with a faint, dim horizon. |
 
 ## Controls
 
@@ -39,8 +39,8 @@ deep blue ocean. This is what you see when you launch the app. |
 
 | | |
 |---|---|
-| ![Wireframe, day](images/wireframe_day.png) | Wireframe in **daylight** — the Gerstner grid under a bright sky. |
-| ![Wireframe, dusk](images/wireframe_dusk.png) | Wireframe at **dusk** — the same grid lit by the low sun. |
+| ![Wireframe, day](wireframe_day.png) | Wireframe in **daylight** — the Gerstner grid under a bright sky. |
+| ![Wireframe, dusk](wireframe_dusk.png) | Wireframe at **dusk** — the same grid lit by the low sun. |
 
 ## What's procedural
 
