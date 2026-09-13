@@ -17,6 +17,14 @@
 // cbuffer: the original 56 floats are UNCHANGED at the front, so water_vs.hlsl
 // (which declares the shorter cbuffer) still works. boatState + wakeParams are
 // appended (floats 56..63) -> 64 total, exactly the D3D12 256-byte push-constant limit.
+//
+// The procedural sky lives in sky.hlsli (shared with water_vs.hlsl). Its ray
+// reconstruction + style parameters are in a SECOND root constant, register b1
+// (SkyRoot), so they do not consume the 64-float b0 budget. The water shader
+// reads b1 too, to mirror the sky in the surface (fresnel) and fog the far water
+// into the sky horizon color.
+
+#include "sky.hlsli"
 
 cbuffer RootConstants : register(b0)
 {
@@ -41,18 +49,18 @@ struct VSOut
 // the bow spray is a small bright patch in front of the hull while planing.
 float3 WakeFoam(float3 world)
 {
-    float2 d     = world.xz - boatState.xz;
-    float2 fwd   = normalize(float2(boatState.y, boatState.w) + 1e-4);
-    float  dist  = length(d);
-    float2 dir   = d * (1.0 / max(dist, 1e-4));
+   float2 d        = world.xz - boatState.xz;
+    float2 hullFwd  = normalize(float2(boatState.y, boatState.w) + 1e-4);
+    float  dist     = length(d);
+    float2 dir      = d * (1.0 / max(dist, 1e-4));
 
-    // Kelvin V: half-angle ~ asin(1/pi) ~= 19.5 deg. 1 inside the cone, 0 outside.
-    float  cosAng  = dot(dir, -fwd);
-    float  inV     = smoothstep(0.88, 0.95, cosAng);        // cos(19.5deg) ~= 0.943
-    float  vFade   = exp(-dist * 0.12);                      // wake decays with distance
+    // Kelvin V: half-angle ~ asin(1/pi) ~= 19.5 deg.  1 inside the cone, 0 outside.
+    float  cosAng   = dot(dir, -hullFwd);
+    float  inV      = smoothstep(0.88, 0.95, cosAng);        // cos(19.5deg) ~= 0.943
+    float  vFade    = exp(-dist * 0.12);                      // wake decays with distance
 
     // Bow spray: bright, close, in front of the hull while planing.
-    float  bowFwd   = dot(dir, fwd);
+    float  bowFwd   = dot(dir, hullFwd);
     float  bowSpray = smoothstep(0.80, 0.98, bowFwd) * (1.0 - smoothstep(0.5, 1.3, dist));
 
     float  moving   = smoothstep(1.5, 4.5, wakeParams.x);    // only when actually moving
@@ -63,29 +71,53 @@ float3 WakeFoam(float3 world)
 float4 main(VSOut input) : SV_Target
 {
     float3 N = normalize(input.normal);
-    float3 L = normalize(lightDir.xyz);
+    float3 L = normalize(lightDir.xyz);                 // = the sky's sun (time-of-day)
     float3 V = normalize(camPosTime.xyz - input.world);
     float3 H = normalize(L + V);
 
     float ndl = saturate(dot(N, L));
 
-    float3 deep = float3(0.01, 0.10, 0.20);
-    float3 shallow = float3(0.04, 0.36, 0.44);
-    float3 base = lerp(deep, shallow, ndl);
+    // Day-ness + sunset amount (matches the sky) for warm tinting + glint falloff.
+    float3 sunDir  = normalize(sun.xyz);
+    float  dayF    = smoothstep(-0.05, 0.15, sunDir.y);
+    float  sunsetT = (1.0 - saturate(sunDir.y / 0.30)) * dayF;
 
-    float spec = pow(saturate(dot(N, H)), 120.0) * 1.6;
-    float foam = smoothstep(0.30, 0.48, input.world.y);
+    // ---- water body: what you see looking DOWN through the surface ----
+    float3 deep    = lerp(float3(0.010, 0.100, 0.200), float3(0.050, 0.050, 0.120), sunsetT);
+    float3 shallow = lerp(float3(0.040, 0.360, 0.440), float3(0.100, 0.180, 0.220), sunsetT);
+    float3 base    = lerp(deep, shallow, ndl);
+    // Low-sun raking light warms the surface (matches the sky's warmth).
+    base += float3(1.0, 0.45, 0.20) * pow(ndl, 2.0) * sunsetT * 0.25;
 
-    float3 col = base * (0.35 + 0.65 * ndl) + spec;
+    // ---- Schlick fresnel: more sky reflection at grazing angles ----
+    float  cosTheta = saturate(dot(N, V));
+    float  F = 0.02 + 0.98 * pow(1.0 - cosTheta, 5.0);
+
+    // ---- mirror the procedural sky in the surface (clouds + sun + gradient) ----
+    float3 refl = SkyColor(reflect(-V, N));
+
+    // ---- sun glint (tight sparkle), dimmed at night ----
+    float  spec = pow(saturate(dot(N, H)), 120.0) * (0.8 + 1.2 * sunsetT) * (0.3 + 0.7 * dayF);
+
+    float  foam = smoothstep(0.30, 0.48, input.world.y);
+
+    // ---- combine: body <-> sky by fresnel, plus glint ----
+    float3 col = lerp(base * (0.35 + 0.65 * ndl), refl, F);
+    col += spec;
     col = lerp(col, float3(0.85, 0.92, 0.97), foam * 0.65);
 
-    // ---- interactive wake foam (new) -------------------------------------
+    // ---- interactive wake foam (Kelvin V + bow spray) ----
     float3 wf = WakeFoam(input.world);
-    col = col + wf;                       // additive white in the V + at the bow
-    col = lerp(col, col * 0.80 + wf, wf.r * 0.4);   // soften the crest slightly
-    // Distance fog hides the edge of the boat-locked grid -> seamless horizon
-    float fog = smoothstep(24.0, 44.0, length(input.world.xz - camPosTime.xz));
-    col = lerp(col, float3(0.04, 0.09, 0.13), fog);
+    col = col + wf;
+    col = lerp(col, col * 0.80 + wf, wf.r * 0.4);
+
+    // ---- distance fog: fade the far water into the SKY horizon (seamless) ----
+    float  fog = smoothstep(24.0, 44.0, length(input.world.xz - camPosTime.xz));
+    float2 dxz = input.world.xz - camPosTime.xz;
+    float  dl  = length(dxz);
+    float2 toPatch = (dl > 1e-3) ? (dxz / dl) : float2(0.0, 1.0);
+    float3 horizonSky = SkyColor(float3(toPatch.x, 0.0, toPatch.y));
+    col = lerp(col, horizonSky, fog);
     return float4(col, 1.0);
 }
 
@@ -131,5 +163,16 @@ float4 psJetski(VSOutJetski input) : SV_Target
 
     float wet = smoothstep(0.15, -0.05, input.world.y);
     col = lerp(col, col * 0.35, wet);
+    return float4(col, 1.0);
+}
+
+// ---- procedural sky: fullscreen triangle, drawn first (depth-write off) ----
+// Rebuild the world-space view ray from NDC + the camera axes (SkyRoot b1) and
+// shade it with the shared sky model. The sky sits at the far plane (z=1) and is
+// drawn before the water, so the water overdraws the below-horizon part.
+float4 skyPS(SkyVSOut input) : SV_Target
+{
+    float3 dir = SkyViewDir(input.ndc);
+    float3 col = SkyColor(dir);
     return float4(col, 1.0);
 }

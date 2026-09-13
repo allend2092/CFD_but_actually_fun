@@ -31,6 +31,7 @@
   <ItemGroup>
     <None Include="water_ps.hlsl" />
     <None Include="water_vs.hlsl" />
+    <None Include="sky.hlsli" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="assets\jetski_asset.h">

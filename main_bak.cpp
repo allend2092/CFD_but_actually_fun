@@ -1155,6 +1155,16 @@ namespace {
         g.cmdList->SetGraphicsRootConstantBufferView(0, g.waterCb->GetGPUVirtualAddress());
         g.cmdList->SetGraphicsRoot32BitConstants(1, 48, g_skyRc, 0);
 
+        {
+            static int diagN = 0;
+            if (++diagN == 1)
+                std::printf("[diag] sky right=(%.3f,%.3f,%.3f) up=(%.3f,%.3f,%.3f) fwd=(%.3f,%.3f,%.3f) sun=(%.3f,%.3f,%.3f,%.3f) pal=(%.2f,%.2f,%.2f) | water mapped=%p cbvHeap=%p\n",
+                    g_skyRc[0],g_skyRc[1],g_skyRc[2], g_skyRc[4],g_skyRc[5],g_skyRc[6],
+                    g_skyRc[8],g_skyRc[9],g_skyRc[10], g_skyRc[12],g_skyRc[13],g_skyRc[14],g_skyRc[15],
+                    g_skyRc[44],g_skyRc[45],g_skyRc[46],
+                    (void*)g.waterCbMapped, (void*)g.cbvHeap.Get());
+        }
+
         // ---- sky: fullscreen triangle, drawn first (depth-write off, z=far) ----
         g.cmdList->SetPipelineState(g.psoSky.Get());
         g.cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1182,8 +1192,8 @@ namespace {
         g.cmdList->Close();   // returns void in this SDK
 
         ID3D12CommandList* lists[] = { g.cmdList.Get() };
-        g.queue->ExecuteCommandLists(1, lists);
-        g.swapChain->Present(1, 0);
+        g.queue->ExecuteCommandLists(1, lists);   // returns void in this SDK
+        HRESULT hrPres = g.swapChain->Present(1, 0);
 
         ++g.fenceValue;
         g.queue->Signal(g.fence.Get(), g.fenceValue);
@@ -1191,6 +1201,17 @@ namespace {
         {
             g.fence->SetEventOnCompletion(g.fenceValue, g.fenceEvent);
             WaitForSingleObject(g.fenceEvent, INFINITE);
+        }
+
+        {
+            // DIAGNOSTIC (revert after): this SDK's ID3D12InfoQueue is only partially defined
+            // (no GetMessage / GetNumMessagesBySeverity / D3D12_MESSAGE_DESC), so just report the
+            // Present HRESULT + device-removed reason. Nonzero deviceRemoved = the GPU dropped the
+            // device (a fatal error) -- that alone would explain a black screen.
+            static int subN = 0;
+            if (++subN <= 2)
+                std::printf("[submit #%d] Present=0x%08X deviceRemoved=0x%08X\n",
+                    subN, (unsigned)hrPres, (unsigned)g.device->GetDeviceRemovedReason());
         }
 
         g.frameIndex = g.swapChain->GetCurrentBackBufferIndex();
