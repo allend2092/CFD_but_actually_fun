@@ -1,86 +1,150 @@
-# CFD_but_actually_fun
+# CFD but actually fun
 
-A from-scratch DirectX 12 water-physics sandbox, inspired by (not affiliated
-with) classic jet-ski racing games. Clean-room implementation: every line of
-C++ and HLSL here is written from first principles.
+A real-time, **asset-free** water-and-boat scene rendered in **Direct3D 12**. The ocean, the
+sky, the light, and the wake are all **procedural** — computed in-shader from a handful of
+constants — with no textures, no skybox, and no baked assets. A planing rigid-body boat with a
+rider rides the Gerstner waves under a physically-motivated sky that moves with the time of day.
 
-The goal is to learn real water physics by building a playable ocean — waves,
-buoyancy, rigid bodies, and eventually rideable craft with AI rivals — while
-keeping it *actually fun* rather than academically correct.
+> **Status: work in progress.** The core ocean, boat, rider, and sky pipeline render end-to-end.
+> See [Roadmap](#roadmap) for what's still coming.
 
-![Milestone 5: A procedurally generated jetski and rider navigating Gerstner waves](CFD_But_Actually_Fun.png)  
-![CFD But Actually Fun - Jetski on Gerstner waves](boatman.png)
+## The scene
 
-*Milestone 5 stopping point: The local model's procedural jetski and IK-driven 
-rider meet the Gerstner ocean. The rider's hips are low-pass filtered, causing 
-the knees and elbows to compress and extend over the waves like real shock 
-absorbers while the hands track the steering column.*
-
-## Current status
-
-| Milestone | State |
+| | |
 |---|---|
-| 1 — Win32 window + D3D12 device, swap chain, fences | ✅ Done |
-| 2 — Pipeline, vertex/index buffers, depth, water grid | ✅ Done |
-| 3 — Animated sum-of-sines water, lighting, foam | ✅ Done |
-| 4 — Gerstner waves + buoyant rigid body, fixed 120 Hz timestep | ✅ Done |
-| 5 — Procedural jetski + rider (two-bone IK, wave absorption) | ✅ **You are here** |
-| 6 — Wake field: moving bodies leave ripples | ⏳ Next |
-| 7 — AI rivals that read steepness and wakes; race logic | ⏳ Planned |
-| 8 — Modes: WaveLab, BuoyancySandbox, TimeTrial | ⏳ Planned |
+| ![Caribbean Evening — the default sunset vista](images/sunset.png) | **Caribbean Evening** — the default vista: a low western sun, warm horizon, and a
+deep blue ocean. This is what you see when you launch the app. |
 
-## What is in the box (so far)
-
-- **Renderer:** hand-rolled DirectX 12 — device, swap chain, RTV/DSV heaps,
-  fence handshake, four PSOs (solid water, wireframe water, crate, jetski), and a
-  56-float root-constant stream. No engine, no framework.
-- **Water:** four Gerstner components with deep-water dispersion (ω = √(g·k)),
-  steepness-budgeted horizontal displacement, analytic normals, crest foam,
-  Blinn–Phong sun glint. A 129×129 grid (16,641 verts) re-simulated on the CPU
-  every frame into a persistently-mapped upload buffer.
-- **World-space water queries:** fixed-point inversion of the Gerstner
-  horizontal shift, so physics can ask "how high is the water at (x, z)?" —
-  the same sampler buoyancy calls every tick.
-- **Floating bodies:** five sample points on the hull underside, each pushing
-  up with ρ·g·V·w·(submerged fraction); per-sample drag; torques from lever
-  arms; full 3D rotation via Euler's rigid-body equations in body space
-  (gyroscopic ω × Iω term included), semi-implicit Euler at fixed 120 Hz.
-- **Procedural Jetski & Rider:** A fully procedural, math-driven vehicle and 
-  rider. The hull is lofted from cross-section stations; the rider is built 
-  from primitive shapes skinned to a joint graph.
-- **Inverse Kinematics (IK):** Analytic two-bone IK solver for arms and legs. 
-  Hands track the steering column (which rotates with input), feet are planted 
-  in the footwells.
-- **Wave Absorption:** A low-pass filter on the rider's hips creates a natural 
-  lag relative to the hull's vertical motion, causing the knees and elbows to 
-  compress and extend over waves.
-- **Debug tools:** F1 wireframe x-ray of the surface.
+| | |
+|---|---|
+| ![A cloudy sky](images/cloudy.png) | **Cloudy** — overcast cloud cover and a muted, hazy grade. |
+| ![Dusk — time scrubbed toward evening](images/dusk.png) | **Dusk** — the sun scrubbed toward the horizon with `[` / `]`. |
+| ![The boat at night](images/night_boat.png) | **Night** — the boat under a near-black sky with a faint, dim horizon. |
 
 ## Controls
 
 | Key | Action |
 |---|---|
-| W / S | Throttle (accelerate / decelerate) |
-| A / D | Steer left / right |
-| F1 | Toggle water wireframe |
-| R  | Re-drop the crate with a random tumble |
+| `W` / `S` | Throttle up / down (with coast-down decay) |
+| `A` / `D` | Steer left / right (with return-to-center decay) |
+| `R` | Reset the boat to the center of the water patch |
+| `F1` | Toggle **wireframe** rendering of the water |
+| `P` | Toggle the **rider** between the static pose and the full IK rig |
+| `[` / `]` | Scrub the **time of day** (the sun moves along its arc, ~1 h/s) |
+| `T` | Jump to the next **sky vista** (cycles all seven presets) |
 
-## Build & run
+### Wireframe
 
-- Windows 10/11, Visual Studio 2022, "Desktop development with C++" workload.
-- Open the solution, set **x64 / Debug**, run with **Ctrl+F5** from Visual
-  Studio. The working directory must be the project folder: shaders are
-  compiled at runtime from `water_vs.hlsl` / `water_ps.hlsl` on disk.
-- **Close the game window before rebuilding.** A running executable locks its
-  file and the link fails with LNK1168. Learned the hard way; documented so
-  future-me doesn't have to.
-- This snapshot is source-only; solution/project files live on the author's
-  machine for now.
+`F1` swaps the solid water shader for a wireframe one, exposing the simulation grid.
 
-## Files
-
-| File | Role |
+| | |
 |---|---|
-| `main.cpp` | The whole C++ side: window, D3D12 bootstrap, wave field, rigid body, frame loop, and integration bridge |
-| `water_vs.hlsl` | Vertex shaders: `main` (water), `mainModel` (crate), `mainJetski` (rider) |
-| `water_ps.hlsl` | Pixel shaders: `
+| ![Wireframe, day](images/wireframe_day.png) | Wireframe in **daylight** — the Gerstner grid under a bright sky. |
+| ![Wireframe, dusk](images/wireframe_dusk.png) | Wireframe at **dusk** — the same grid lit by the low sun. |
+
+## What's procedural
+
+- **Ocean** — summed Gerstner waves give the surface its shape and normals; a boat-locked
+  **wake heightfield** adds the V-shaped disturbance the hull leaves behind. Foam is driven by the
+  boat's state and the wake in the water shader.
+- **Boat** — a 2-DOF **rigid body** that planes: it takes on speed, trim, and roll as you
+  throttle, and settles back to calm when you let off.
+- **Rider** — either a **static pose** rigid on the hull (default) or a full **inverse-kinematics
+  rig** (`P`) that tracks the hull's motion.
+- **Sky** — a fullscreen pass that reconstructs the world-space view ray per pixel and shades it
+  with:
+  - a vertical day↔night **gradient**,
+  - **Mie** forward-scatter (horizon haze + sun glow),
+  - **Rayleigh**-motivated scattering (blue sky, reddening toward the sun),
+  - a bright **sun disc**,
+  - **FBM procedural clouds** with coverage, drift, and feature scale,
+  - a per-vista **color grade** (palette).
+- **Light** — one sun, driven by the time of day (sunrise 06:00 east, noon 12:00 due south at
+  75°, sunset 18:00 west), lights the sky, the water, the crate buoy, and the jet-ski identically.
+- **Clear color** — the CPU computes the same horizon color the shader would, so any uncovered
+  pixel melts into the sky instead of showing a seam.
+
+The render target is a plain `R8G8B8A8_UNORM` swap chain — no sRGB view, no bloom, no tonemapping.
+Values above 1.0 clamp to white.
+
+## Sky vistas
+
+Press `T` to cycle, or `[` / `]` to scrub the time of day continuously. Seven presets ship:
+
+| # | Vista | Default time | Character |
+|---|---|---|---|
+| 0 | Caribbean Evening | 17:36 | warm low sun, pink-orange horizon, deep blue water |
+| 1 | Caribbean Noon | 12:00 | bright blue, high sun, crisp |
+| 2 | Caribbean Dawn | 06:24 | soft rose horizon, gentle light |
+| 3 | Hazy Tropical | 15:00 | heavy white haze, washed-out warmth |
+| 4 | Clear Blue | 13:00 | saturated blue, almost no clouds |
+| 5 | Overcast | 14:00 | flat grey, dense cloud cover, muted grade |
+| 6 | Night | 23:30 | near-black sky, faint horizon, dim light |
+
+## Building
+
+- **Toolchain:** Visual Studio 2022, MSVC `v143`, **C++20**, Windows 10 SDK.
+- **Project:** `CFD_but_actually_fun.vcxproj` (a Windows console app — a console window stays
+  open showing live telemetry).
+- **GPU:** any D3D12-capable adapter; the first available is used.
+
+```
+1. Open CFD_but_actually_fun.sln in Visual Studio 2022.
+2. Build (x64).
+3. Run from the project directory so D3DCompileFromFile() can find the .hlsl files,
+   e.g.  D:\written_software\CFD_local_qwen_sky\
+```
+
+> **Note:** the shaders are compiled at runtime with `D3DCompileFromFile`, so the `.hlsl` files
+> must sit next to the exe (or be found relative to the working directory). Build and run from the
+> source folder and it just works.
+
+The D3D12 debug layer is enabled at startup; run under the debugger to see validation messages in
+the VS **Output** window.
+
+## Project layout
+
+```
+CFD_but_actually_fun.sln
+CFD_but_actually_fun.vcxproj
+main.cpp                  D3D12 setup, game loop, boat/camera, sky packing, rendering
+sky.hlsli                 shared sky model (SkyRoot, SkyViewDir, SkyColor, SkyClouds)
+water_vs.hlsl             water + model + jet-ski + sky vertex shaders
+water_ps.hlsl             water + crate + jet-ski + sky pixel shaders
+images/                   screenshots referenced by this README
+assets/
+  boat_sim.h              2-DOF planing rigid-body boat (trim + roll)
+  wake_field.h            boat-locked interactive wake heightfield
+  jetski_asset.h/.cpp     jet-ski hull/rider mesh data
+  jetski_internal.h       rig definition (complete type)
+  jetski_ik.cpp           rider inverse-kinematics solver
+  *.obj                   jet-ski pose exports (idle / bounce / turn)
+```
+
+## Telemetry
+
+The console prints a live line each frame:
+
+```
+[telemetry] speed 9.4 m/s  hdg +11.7 deg  pos (10.4, 56.9)  trim +0.0 deg  roll +0.2 deg  rider IK  sky Caribbean Evening 17:36
+```
+
+`rider` shows `STATIC` or `IK` depending on the `P` toggle; `sky` shows the active vista and the
+current time of day.
+
+## Roadmap
+
+Work in progress — likely next:
+
+- [ ] Rider IK hardening around the ~180° yaw case (the rig degenerates at extreme heading).
+- [ ] LDR→HDR upgrade: sRGB render target, exposure + tonemap for the sun and highlights.
+- [ ] Water shading polish: specular sun glint, depth-based color, foam detail.
+- [ ] Camera work: chase-cam framing, FOV/speed feel.
+- [ ] Performance: larger water grid, more wave components, cloud octaves.
+- [ ] Packaging: hide the console, a proper window, settings.
+
+## Tech stack
+
+Direct3D 12 (flip-discard swap chain, `R8G8B8A8_UNORM`), HLSL `vs_5_0`/`ps_5_0` compiled at
+runtime via `D3DCompiler`, C++20, MSVC. All geometry is procedural or generated at startup — the
+only non-generated assets are the small jet-ski mesh exports in `assets/`.
