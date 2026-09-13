@@ -9,7 +9,7 @@ buoyancy, rigid bodies, and eventually rideable craft with AI rivals — while
 keeping it *actually fun* rather than academically correct.
 
 ![Milestone 5: A procedurally generated jetski and rider navigating Gerstner waves](CFD_But_Actually_Fun.png)  
-(boatman.png)
+![CFD But Actually Fun - Jetski on Gerstner waves](CFD_But_Actually_Fun.png)
 
 *Milestone 5 stopping point: The local model's procedural jetski and IK-driven 
 rider meet the Gerstner ocean. The rider's hips are low-pass filtered, causing 
